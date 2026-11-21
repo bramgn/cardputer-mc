@@ -369,7 +369,9 @@ def uninstall(argv):
 
     home = os.path.realpath(HOME_DIR)
     if home in ('/', os.path.realpath(os.path.expanduser('~'))) or not any(
-            os.path.exists(os.path.join(home, n)) for n in ('venv', 'meshcore-pi', 'config.toml')):
+            os.path.lexists(os.path.join(home, n)) for n in
+            ('venv', 'meshcore-pi', 'config.toml', 'contacts.mesh', 'channels.json', 'meshcore.log', 'local-radio.log',
+             '.lgd-nfy0')):
         print(f'nothing to remove: {HOME_DIR} does not look like a {APP} install')
         return 0
     pids = _running_pids()
@@ -396,10 +398,10 @@ def uninstall(argv):
         print('aborted')
         return 1
     for p in remove:
-        if os.path.islink(p) or os.path.isfile(p):
-            os.remove(p)
-        else:
+        if os.path.isdir(p) and not os.path.islink(p):
             shutil.rmtree(p)
+        else:
+            os.remove(p)                 # files, symlinks and the FIFO that lgpio leaves behind (.lgd-nfy0)
     if not opts.keep_identity:
         try:
             os.rmdir(home)
