@@ -1,0 +1,3117 @@
+#!/usr/bin/env python3
+"""cardputer-mesh: a MeshCore chat client for the M5 CardputerZero with the Cap-LoRa-1262 module.
+
+One file. `cardputer-mesh install` sets everything up once (apt packages, a venv, meshcore-pi,
+a config with a fresh identity); `cardputer-mesh` then starts meshcore-pi as a child process,
+switches the module's 5V supply on, and runs the ncurses chat on top of it. Quitting stops
+meshcore-pi and switches the 5V supply off again.
+
+meshcore-pi (https://github.com/brianwiddas/meshcore-pi) drives the SX1262 over SPI and exposes
+a MeshCore companion-radio interface on 127.0.0.1:5000; this client talks to it with the
+`meshcore` Python library. The chat UI is derived from mcorechat.
+
+State lives in ~/.local/share/cardputer-mesh (override with CARDPUTER_MESH_HOME):
+  config.toml       radio settings, name and private key of this node (mode 600)
+  meshcore-pi/      the pinned meshcore-pi checkout
+  venv/             Python environment for both
+  contacts.mesh, channels.json, meshcore.log, local-radio.log
+Chat history and UI settings live in ~/.config/cardputer-mesh.
+"""
+
+import argparse
+import asyncio
+import curses
+import locale
+import os
+import collections
+import json
+import logging
+import math
+import textwrap
+import time
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+import ctypes
+import signal
+import socket
+import re
+import subprocess
+import sys
+
+
+
+# ======================================================================
+# bootstrap: paths, installer, re-exec into the venv (stdlib only)
+# ======================================================================
+
+APP = 'cardputer-mesh'
+__version__ = '0.1.0'
+HOME_DIR = os.path.expanduser(os.environ.get('CARDPUTER_MESH_HOME', '~/.local/share/cardputer-mesh'))
+VENV_DIR = os.path.join(HOME_DIR, 'venv')
+VENV_PY = os.path.join(VENV_DIR, 'bin', 'python')
+PI_DIR = os.path.join(HOME_DIR, 'meshcore-pi')
+PI_CONFIG = os.path.join(HOME_DIR, 'config.toml')
+PI_REPO = 'https://github.com/brianwiddas/meshcore-pi'
+PI_COMMIT = '85de8dc'                    # the version this client was tested with
+APT_PACKAGES = ['git', 'python3-venv', 'python3-rpi-lgpio', 'python3-lgpio']
+PIP_PACKAGES = ['meshcore', 'pycryptodome', 'aiotools', 'pyserial_asyncio', 'typing-extensions', 'LoRaRF']
+
+CONFIG_TEMPLATE = """\
+# meshcore-pi configuration for cardputer-mesh (M5 CardputerZero + Cap-LoRa-1262)
+interfaces = ["caplora"]
+devices = ["companion"]
+
+[dispatcher]
+pass_internal = true
+
+[interface.caplora]
+type = "lora"
+# EU/UK narrow preset. Change these to match the mesh you want to join.
+frequency = 869618000
+sf = 8
+bw = 62500
+cr = 8
+# dBm. In the EU, 869.4-869.65 MHz allows up to 27 dBm ERP (10% duty cycle);
+# most of the rest of 863-870 MHz only 14 dBm. Check your local rules.
+txpower = 14
+# SX1262 wiring on the CardputerZero: SPI0 CS1 (/dev/spidev0.1), BCM pins
+spi = 0
+cs = 1
+reset = 26
+busy = 22
+irq = 23
+txen = -1
+rxen = -1
+# TCXO on DIO3 (3.0 V), RF switch on DIO2
+dio3.voltage = 3.0
+dio3.tcxo_delay = 10
+dio2.rfswitch = true
+
+[device.companion]
+name = "{name}"
+privatekey = "{key}"
+contacts = "contacts.mesh"
+channelfile = "channels.json"
+add_public_channel = true
+interface = "wifi"
+wifi.port = 5000
+wifi.listen = "127.0.0.1"
+"""
+
+
+def _run(cmd, **kw):
+    print('  $ ' + ' '.join(cmd), flush=True)
+    subprocess.run(cmd, check=True, **kw)
+
+
+def install(argv):
+    ap = argparse.ArgumentParser(prog=f'{APP} install', description='Set up meshcore-pi, a venv and a config.')
+    ap.add_argument('--name', default='Cardputer', help='node name shown to others (default: Cardputer)')
+    ap.add_argument('--key', metavar='HEX', help='existing 32-byte private key (64 hex characters) instead of a new one')
+    ap.add_argument('-y', '--yes', action='store_true', help='do not ask before running sudo apt-get')
+    opts = ap.parse_args(argv)
+    if opts.key and not re.fullmatch(r'[0-9a-fA-F]{64}', opts.key):
+        raise SystemExit('--key must be 64 hex characters')
+    os.makedirs(HOME_DIR, exist_ok=True)
+    if not os.path.exists('/dev/spidev0.1'):
+        print('warning: /dev/spidev0.1 not found; is SPI enabled and is this a CardputerZero?')
+
+    print('1/5 apt packages')
+    missing = [p for p in APT_PACKAGES
+               if subprocess.run(['dpkg', '-s', p], capture_output=True).returncode != 0]
+    if missing:
+        if not opts.yes and input(f'  sudo apt-get install {" ".join(missing)} ? [Y/n] ').strip().lower() == 'n':
+            raise SystemExit('aborted')
+        _run(['sudo', 'apt-get', 'install', '-y'] + missing)
+    else:
+        print('  all present')
+
+    print('2/5 python venv')
+    if not os.path.isfile(VENV_PY):
+        _run([sys.executable, '-m', 'venv', '--system-site-packages', VENV_DIR])
+    pip = [VENV_PY, '-m', 'pip']
+    _run(pip + ['install', '--retries', '10', '--timeout', '60', '-q'] + PIP_PACKAGES)
+    # LoRaRF pulls in RPi.GPIO, which shadows the rpi-lgpio shim from apt (the Pi 5 style GPIO API)
+    subprocess.run(pip + ['uninstall', '-y', '-q', 'RPi.GPIO'], capture_output=True)
+    check = subprocess.run([VENV_PY, '-c', 'import RPi.GPIO as G, LoRaRF, meshcore; print(G.__file__)'],
+                           capture_output=True, text=True)
+    if check.returncode != 0:
+        raise SystemExit('python check failed:\n' + check.stderr.strip())
+    print('  ok:', check.stdout.strip())
+
+    print('3/5 meshcore-pi')
+    if not os.path.isdir(os.path.join(PI_DIR, '.git')):
+        _run(['git', 'clone', '-q', PI_REPO, PI_DIR])
+    _run(['git', '-C', PI_DIR, 'checkout', '-q', PI_COMMIT])
+
+    print('4/5 config')
+    if os.path.exists(PI_CONFIG):
+        print(f'  keeping existing {PI_CONFIG}')
+    else:
+        key = (opts.key or os.urandom(32).hex()).lower()
+        fd = os.open(PI_CONFIG, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write(CONFIG_TEMPLATE.format(name=opts.name.replace('"', ''), key=key))
+        print(f'  wrote {PI_CONFIG} (mode 600; contains this node\'s private key)')
+
+    print('5/5 command')
+    link_dir = os.path.expanduser('~/.local/bin')
+    os.makedirs(link_dir, exist_ok=True)
+    link = os.path.join(link_dir, APP)
+    target = os.path.realpath(__file__)
+    if os.path.realpath(link) != target:
+        if os.path.lexists(link):
+            os.remove(link)
+        os.symlink(target, link)
+    print(f'  {link} -> {target}')
+    print(f'\nDone. Run: {APP}   (make sure ~/.local/bin is on your PATH)')
+    return 0
+
+
+def _bootstrap():
+    if sys.argv[1:2] in (['--version'], ['-V']):
+        print(f'{APP} {__version__}')
+        sys.exit(0)
+    if sys.argv[1:2] in (['-h'], ['--help']):
+        print(f'usage: {APP}\n       {APP} install [--name NAME] [--key HEX] [-y]\n       {APP} --version\n')
+        print(__doc__.split('State lives')[0].strip())
+        sys.exit(0)
+    if sys.argv[1:2] == ['install']:
+        sys.exit(install(sys.argv[2:]))
+    if os.path.realpath(sys.prefix) != os.path.realpath(VENV_DIR):
+        if not os.path.isfile(VENV_PY):
+            sys.exit(f'{APP}: not set up yet. Run: {sys.argv[0]} install')
+        os.execv(VENV_PY, [VENV_PY, os.path.realpath(__file__)] + sys.argv[1:])
+
+
+_bootstrap()
+
+from meshcore import MeshCore, TCPConnection
+from meshcore.events import EventType
+
+
+# ======================================================================
+# common
+# ======================================================================
+
+CONFIG_FILE = os.path.expanduser('~/.config/cardputer-mesh/config.json')
+HISTORY_FILE = os.path.expanduser('~/.config/cardputer-mesh/history.json')
+PASSWORDS_FILE = os.path.expanduser('~/.config/cardputer-mesh/passwords.json')   # opt-in, mode 0600
+RX_KEY = ('r', 0)           # 'Radio': received packets as a pseudo-conversation
+LOG_KEY = ('l', 0)          # 'Log': status messages and library log lines
+MAX_RETRIES = 5
+HISTORY_KEEP = 500          # messages kept per conversation
+SIDEBAR_W = 24
+MAX_CHANNELS = 8
+NODE_TYPES = {1: 'client', 2: 'repeater', 3: 'room'}
+CTRL_Q, CTRL_C = 17, 3
+LOG_LINES = 1000
+
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def describe_error(payload: dict) -> str:
+    """Human-readable reason for a radio ERROR event (payload may be empty)."""
+    if payload.get('code_string'):
+        return payload['code_string']
+    if payload.get('reason'):
+        return payload['reason']
+    if payload.get('error'):
+        return str(payload['error'])
+    if 'error_code' in payload:
+        return f'error code {payload["error_code"]}'
+    return 'radio rejected the command (no error code)'
+
+
+class LogBuffer(logging.Handler):
+    """Collects log records (ours and the meshcore library's); the App shows them as the Log conversation."""
+
+    def __init__(self):
+        super().__init__(logging.INFO)
+        self.records: collections.deque = collections.deque(maxlen=LOG_LINES)   # kept until a sink attaches
+        self.sink = None
+
+    def emit(self, record):
+        try:
+            if self.sink:
+                self.sink(record)
+            else:
+                self.records.append(record)
+        except Exception:
+            pass
+
+
+LOG = LogBuffer()
+log = logging.getLogger(APP)
+
+
+@dataclass
+class Msg:
+    ts: int
+    who: str
+    text: str
+    mine: bool = False
+    status: str = ''   # '' | 'sent' | 'acked' | 'failed'
+    recv: int = 0                          # local time we saw it
+    info: dict = field(default_factory=dict)   # raw radio fields for the details view
+
+
+def hhmm(ts: int) -> str:
+    return datetime.fromtimestamp(ts or datetime.now().timestamp()).strftime('%H:%M')
+
+
+# ======================================================================
+# theme
+# ======================================================================
+
+# display attributes; init_colors() swaps in colours when the terminal has them
+theme_REV = curses.A_REVERSE                   # bars and popups
+theme_SEL = curses.A_REVERSE | curses.A_BOLD   # highlighted row
+theme_HEAD = curses.A_BOLD | curses.A_UNDERLINE
+theme_UNREAD = curses.A_BOLD
+theme_ME = curses.A_DIM
+theme_NOTE = curses.A_DIM
+theme_FAIL = curses.A_BOLD
+theme_GOOD_BAR = curses.A_BOLD                 # success / failure on bars and popups
+theme_BAD_BAR = curses.A_BOLD | curses.A_UNDERLINE
+theme_BAD_WORDS = ('fail', 'not sent', 'error', 'no reply', 'timed out', 'incomplete', 'unknown',
+             'not connected', 'no response', 'no free', 'too long', 'must be', 'already exists',
+             'usage', 'no repeater', 'ambiguous', 'no stored', 'empty reply')
+theme_GOOD_WORDS = ('reachable', 'saved', 'route discovered', 'created', 'removed')
+
+
+theme_PROBLEM_WORDS = theme_BAD_WORDS + ('usage', 'no command', 'select a contact', 'not in the contact', 'read-only')
+
+
+def theme_is_problem(text: str) -> bool:
+    t = text.lower()
+    return any(x in t for x in theme_PROBLEM_WORDS)
+
+
+def theme_result_attr(text: str, base: int, red: bool = True) -> int:
+    """Green for successful results, red for failed ones (if `red`), else base."""
+    t = text.lower()
+    if any(x in t for x in theme_BAD_WORDS):
+        return theme_BAD_BAR if red else base
+    if any(x in t for x in theme_GOOD_WORDS):
+        return theme_GOOD_BAR
+    return base
+
+
+theme_C = {n: getattr(curses, 'COLOR_' + n.upper()) for n in
+     ('black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white')}
+theme_C['default'] = -1
+# per theme: (fg, bg) for bars/popups, selection, headers, unread, own messages, notes, failures
+theme_THEMES = {
+    'blue': (('white', 'blue'), ('black', 'cyan'), ('cyan', 'default'), ('yellow', 'default'),
+             ('green', 'default'), ('magenta', 'default'), ('red', 'default')),
+    'green': (('black', 'green'), ('white', 'black'), ('green', 'default'), ('yellow', 'default'),
+              ('green', 'default'), ('cyan', 'default'), ('red', 'default')),
+    'amber': (('black', 'yellow'), ('yellow', 'black'), ('yellow', 'default'), ('white', 'default'),
+              ('yellow', 'default'), ('magenta', 'default'), ('red', 'default')),
+    'light': (('white', 'black'), ('white', 'blue'), ('blue', 'default'), ('default', 'default'),
+              ('green', 'default'), ('magenta', 'default'), ('red', 'default')),
+    # 256-colour themes (ints are xterm palette indexes; terminals with fewer colours get the nearest basic colour)
+    'vampire':   ((253, 61), (234, 212), (141, 'default'), (228, 'default'), (84, 'default'), (117, 'default'), (203, 'default')),
+    'fjord':     ((254, 60), (236, 110), (110, 'default'), (222, 'default'), (108, 'default'), (139, 'default'), (167, 'default')),
+    'sundial':   ((230, 23), (234, 136), (37, 'default'), (136, 'default'), (100, 'default'), (162, 'default'), (160, 'default')),
+    'harvest':   ((223, 237), (235, 172), (172, 'default'), (214, 'default'), (142, 'default'), (132, 'default'), (167, 'default')),
+    'shibuya':   ((189, 60), (234, 111), (111, 'default'), (215, 'default'), (149, 'default'), (141, 'default'), (204, 'default')),
+    'synthwave': ((231, 54), (234, 207), (207, 'default'), (51, 'default'), (51, 'default'), (213, 'default'), (203, 'default')),
+    'deepsea':   ((195, 24), (233, 80), (80, 'default'), (221, 'default'), (79, 'default'), (110, 'default'), (209, 'default')),
+    'rosewater': ((224, 96), (235, 217), (183, 'default'), (222, 'default'), (109, 'default'), (175, 'default'), (204, 'default')),
+    'mossy':     ((194, 22), (233, 107), (107, 'default'), (186, 'default'), (150, 'default'), (180, 'default'), (167, 'default')),
+    'parchment': ((236, 223), (255, 130), (94, 'default'), ('default', 'default'), (64, 'default'), (125, 'default'), (124, 'default')),
+    'mono': None,
+}
+
+
+def theme_col(c) -> int:
+    """A colour spec: basic name, 'default', or a 256-colour index (nearest basic colour on small terminals)."""
+    if isinstance(c, str):
+        return theme_C[c]
+    if curses.COLORS >= 256:
+        return c
+    if c < 16:
+        r, g, b = (c & 1) * 255, (c >> 1 & 1) * 255, (c >> 2 & 1) * 255
+    elif c < 232:
+        r, g, b = ((c - 16) // 36) * 51, ((c - 16) // 6 % 6) * 51, ((c - 16) % 6) * 51
+    else:
+        r = g = b = 8 + (c - 232) * 10
+    return (r >= 128) | (g >= 128) << 1 | (b >= 128) << 2   # curses colour numbers are bit-ordered r,g,b
+
+
+theme_DESCRIPTIONS = {
+    'blue': 'classic white-on-blue bars', 'green': 'green phosphor terminal', 'amber': 'amber CRT',
+    'light': 'for light terminals', 'mono': 'no colour, bold and reverse only',
+    'vampire': 'purple and pink on dark (Dracula-ish)', 'fjord': 'cold blues and soft frost (Nord-ish)',
+    'sundial': 'teal and mustard (Solarized-ish)', 'harvest': 'warm retro earth tones (Gruvbox-ish)',
+    'shibuya': 'rainy neon night (Tokyo Night-ish)', 'synthwave': 'magenta and cyan 80s grid',
+    'deepsea': 'dark teal with coral accents', 'rosewater': 'dusky rose and pine (Rose Pine-ish)',
+    'mossy': 'forest greens and bark', 'parchment': 'warm paper for light terminals',
+}
+
+
+def theme_init_colors(theme: str = 'blue'):
+    global theme_REV, theme_SEL, theme_HEAD, theme_UNREAD, theme_ME, theme_NOTE, theme_FAIL, theme_GOOD_BAR, theme_BAD_BAR
+    pairs = theme_THEMES.get(theme)
+    if pairs is None or not curses.has_colors():
+        theme_REV, theme_SEL, theme_HEAD = curses.A_REVERSE, curses.A_REVERSE | curses.A_BOLD, curses.A_BOLD | curses.A_UNDERLINE
+        theme_UNREAD, theme_ME, theme_NOTE, theme_FAIL = curses.A_BOLD, curses.A_DIM, curses.A_DIM, curses.A_BOLD
+        theme_GOOD_BAR, theme_BAD_BAR = curses.A_BOLD, curses.A_BOLD | curses.A_UNDERLINE
+        return
+    curses.start_color()
+    curses.use_default_colors()
+    for n, (fg, bg) in enumerate(pairs, 1):
+        curses.init_pair(n, theme_col(fg), theme_col(bg))
+    theme_REV = curses.color_pair(1)
+    theme_SEL = curses.color_pair(2) | curses.A_BOLD
+    theme_HEAD = curses.color_pair(3) | curses.A_BOLD
+    theme_UNREAD = curses.color_pair(4) | curses.A_BOLD
+    theme_ME = curses.color_pair(5)
+    theme_NOTE = curses.color_pair(6)
+    theme_FAIL = curses.color_pair(7) | curses.A_BOLD
+    curses.init_pair(8, curses.COLOR_BLACK, curses.COLOR_GREEN)
+    curses.init_pair(9, curses.COLOR_WHITE, curses.COLOR_RED)
+    theme_GOOD_BAR = curses.color_pair(8)
+    theme_BAD_BAR = curses.color_pair(9) | curses.A_BOLD
+
+
+# ======================================================================
+# localradio
+# ======================================================================
+
+HOST, PORT = '127.0.0.1', 5000          # meshcore-pi's companion wifi.listen / wifi.port
+PI_PYTHON = VENV_PY
+SPIDEV = '/dev/spidev0.1'                # Cap-LoRa-1262 sits on SPI0 CS1
+LED_5V = '/sys/class/leds/ext_5v_out/brightness'
+LOG_FILE = os.path.join(HOME_DIR, 'local-radio.log')
+READY = b'Server listening on'
+START_TIMEOUT = 25.0
+
+
+def available() -> bool:
+    """True on a machine where the local radio can be started."""
+    return (os.path.exists(SPIDEV) and os.path.isfile(PI_PYTHON) and os.path.isfile(PI_CONFIG)
+            and os.path.isfile(os.path.join(PI_DIR, 'meshcore.py')))
+
+
+def _pi_env() -> dict:
+    # meshcore-pi does sys.path.append("./lib/pure25519"), relative to the cwd; we run it from HOME_DIR
+    libs = [os.path.join(PI_DIR, 'lib', 'pure25519'), os.path.join(PI_DIR, 'lib', 'ESPythoNOW')]
+    return dict(os.environ, PYTHONPATH=os.pathsep.join(libs + [os.environ.get('PYTHONPATH', '')]).rstrip(os.pathsep))
+
+
+def _set_5v(on: bool):
+    try:
+        with open(LED_5V, 'w') as f:
+            f.write('255' if on else '0')
+    except OSError:
+        pass                              # no such LED (not a Cardputer) or no permission
+
+
+def _port_free() -> bool:
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((HOST, PORT))
+        except OSError:
+            return False
+    return True
+
+
+def _die_with_parent():
+    # if the app is killed outright, don't leave meshcore-pi hogging SPI and a CPU core
+    try:
+        ctypes.CDLL('libc.so.6', use_errno=True).prctl(1, signal.SIGTERM)   # PR_SET_PDEATHSIG
+    except Exception:
+        pass
+
+
+def _tail(path: str, start: int, lines: int = 3) -> str:
+    try:
+        with open(path, 'rb') as f:
+            f.seek(start)
+            text = f.read().decode(errors='replace')
+    except OSError:
+        return ''
+    return ' | '.join(text.strip().splitlines()[-lines:])
+
+
+class LocalRadio:
+    def __init__(self):
+        self.proc = None
+
+    async def start(self):
+        if not available():
+            raise RuntimeError(f'local radio not available (need {SPIDEV}); run: {APP} install')
+        if not _port_free():
+            raise RuntimeError(f'port {PORT} already in use (is meshcore-pi already running?)')
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        start_at = os.path.getsize(LOG_FILE) if os.path.exists(LOG_FILE) else 0
+        _set_5v(True)
+        try:
+            with open(LOG_FILE, 'ab') as log:
+                self.proc = await asyncio.create_subprocess_exec(
+                    PI_PYTHON, os.path.join(PI_DIR, 'meshcore.py'), PI_CONFIG, cwd=HOME_DIR, env=_pi_env(),
+                    stdin=asyncio.subprocess.DEVNULL, stdout=log, stderr=log,
+                    start_new_session=True, preexec_fn=_die_with_parent)
+            # meshcore-pi writes its own meshcore.log (in HOME_DIR); its stdout/stderr (tracebacks) land in LOG_FILE.
+            # Ready = the companion server is listening, which it logs to meshcore.log.
+            pi_log = os.path.join(HOME_DIR, 'meshcore.log')
+            pi_start = os.path.getsize(pi_log) if os.path.exists(pi_log) else 0
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + START_TIMEOUT
+            while loop.time() < deadline:
+                if self.proc.returncode is not None:
+                    detail = _tail(LOG_FILE, start_at) or _tail(pi_log, pi_start, 1)
+                    raise RuntimeError(f'meshcore-pi exited ({self.proc.returncode}): {detail}')
+                try:
+                    with open(pi_log, 'rb') as f:
+                        f.seek(0 if os.path.getsize(pi_log) < pi_start else pi_start)
+                        if READY in f.read():
+                            await asyncio.sleep(0.3)
+                            return
+                except OSError:
+                    pass
+                await asyncio.sleep(0.25)
+            raise RuntimeError(f'meshcore-pi did not start within {START_TIMEOUT:.0f}s')
+        except BaseException:
+            await self.stop()
+            raise
+
+    async def stop(self):
+        proc, self.proc = self.proc, None
+        if proc is not None and proc.returncode is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), 5)
+            except asyncio.TimeoutError:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+        _set_5v(False)
+
+
+# ======================================================================
+# channels
+# ======================================================================
+
+class ChannelsMixin:
+    NOTIFY_MODES = ('all', 'mentions', 'none')
+    KEEP_CHOICES = (50, 100, 250, 500)
+
+    def chan_pref(self, key: tuple) -> dict:
+        return self.chan_prefs.get(self.name_for(key), {})
+
+    def chan_set(self, key: tuple, **kw):
+        name = self.name_for(key)
+        p = self.chan_prefs.setdefault(name, {})
+        p.update(kw)
+        if p.get('notify', 'all') == 'all':
+            p.pop('notify', None)
+        if p.get('keep', HISTORY_KEEP) == HISTORY_KEEP:
+            p.pop('keep', None)
+        if not p.get('blocked'):
+            p.pop('blocked', None)
+        if not p:
+            del self.chan_prefs[name]
+        self.save_config()
+
+    def keep_for(self, key: tuple) -> int:
+        return self.chan_pref(key).get('keep', HISTORY_KEEP) if key and key[0] == 'c' else HISTORY_KEEP
+
+    @staticmethod
+    def sender_of(msg: Msg) -> str:
+        """Channel text arrives as 'sender: message'."""
+        head, sep, _ = msg.text.partition(': ')
+        return head if sep and not msg.mine else ''
+
+    def is_blocked(self, key: tuple, sender: str) -> bool:
+        return bool(sender) and sender.lower() in (b.lower() for b in self.chan_pref(key).get('blocked', []))
+
+    def counts_unread(self, key: tuple, msg: Msg) -> bool:
+        if key[0] != 'c':
+            return True
+        mode = self.chan_pref(key).get('notify', 'all')
+        if mode == 'mentions':
+            me = ((self.mc.self_info or {}).get('name') if self.mc else '') or ''
+            return bool(me) and me.lower() in msg.text.lower()
+        return mode == 'all'
+
+    def chan_actions(self, key: tuple) -> tuple:
+        p = self.chan_pref(key)
+        acts = [('Chat', 'chat'),
+                (f'Notifications: {p.get("notify", "all")}', 'notify'),
+                ('Rename channel...', 'rename'),
+                (f'Message retention: last {p.get("keep", HISTORY_KEEP)}', 'keep'),
+                ('Participants / blocked', 'people'),
+                ('Block / unblock sender...', 'block'),
+                ('Details / share key', 'chdetails'),
+                ('Clear history', 'clear')]
+        if key[1] != 0:
+            acts.append(('Remove channel', 'chremove'))
+        return tuple(acts)
+
+    def participants(self, key: tuple) -> list[str]:
+        seen: dict[str, list] = {}
+        for m in self.history.get(key, []):
+            s = self.sender_of(m)
+            if s:
+                e = seen.setdefault(s, [0, 0])
+                e[0] += 1
+                e[1] = max(e[1], m.recv or m.ts)
+        blocked = self.chan_pref(key).get('blocked', [])
+        for b in blocked:
+            if b.lower() not in (s.lower() for s in seen):
+                seen[b] = [0, 0]
+        rows = []
+        for s, (n, last) in sorted(seen.items(), key=lambda kv: -kv[1][1]):
+            tag = '  [blocked]' if s.lower() in (b.lower() for b in blocked) else ''
+            rows.append(f'{s}{tag}')
+            rows.append(f'    {n} message{"s" if n != 1 else ""}' + (f', last {hhmm(last)}' if last else ''))
+        return rows or ['Nobody has posted here yet.']
+
+    async def channel_action(self, action: str, key: tuple):
+        name = self.name_for(key)
+        if action == 'notify':
+            modes = self.NOTIFY_MODES
+            mode = modes[(modes.index(self.chan_pref(key).get('notify', 'all')) + 1) % len(modes)]
+            self.chan_set(key, notify=mode)
+            if mode == 'none':
+                self.unread.pop(key, None)
+        elif action == 'keep':
+            ch = self.KEEP_CHOICES
+            cur = self.chan_pref(key).get('keep', HISTORY_KEEP)
+            keep = ch[(ch.index(cur) + 1) % len(ch)] if cur in ch else ch[0]
+            self.chan_set(key, keep=keep)
+            ms = self.history.get(key, [])
+            del ms[:-keep]
+        elif action == 'people':
+            self.show(f'Participants: {name}', self.participants(key))
+        elif action == 'block':
+            self.ask = {'label': 'Sender to block / unblock (as shown in the channel)', 'text': '',
+                        'cb': lambda text, _c: self.toggle_block(key, text), 'contact': None}
+        elif action == 'rename':
+            self.ask = {'label': f'Rename {name} to', 'text': name,
+                        'cb': lambda text, _c: self.apply_rename(key[1], name, text), 'contact': None}
+
+    async def toggle_block(self, key: tuple, who: str):
+        who = who.strip()
+        if not who:
+            return
+        blocked = list(self.chan_pref(key).get('blocked', []))
+        hit = next((b for b in blocked if b.lower() == who.lower()), None)
+        if hit:
+            blocked.remove(hit)
+            self.status = f'unblocked {hit}'
+        else:
+            blocked.append(who)
+            self.status = f'blocked {who}: their new messages in {self.name_for(key)} are dropped'
+        self.chan_set(key, blocked=blocked)
+        self.dirty = True
+
+    async def apply_rename(self, idx: int, old: str, new: str):
+        new = new.strip()
+        if not new or new == old:
+            return
+        if old.startswith('#') or new.startswith('#'):
+            self.status = 'hashtag channels get their key from the name: join the new name with /channel instead'
+            return
+        secret = self.chan_secrets.get(idx)
+        if not secret:
+            self.status = 'channel secret unknown: use /reload and try again'
+            return
+        if not self.need_radio():
+            return
+        async with self.radio_lock:
+            r = await self.mc.commands.set_channel(idx, new, bytes.fromhex(secret))
+        if r.type == EventType.ERROR:
+            self.status = f'rename failed: {describe_error(r.payload)}'
+            return
+        if old in self.chan_prefs:
+            self.chan_prefs[new] = self.chan_prefs.pop(old)
+            self.save_config()
+        await self.load_channels()
+        self.status = f'renamed {old} to {new}'
+        self.dirty = True
+
+
+# ======================================================================
+# repeater
+# ======================================================================
+
+def battery_text(mv) -> str:
+    """'3912 mV (76%)' for a LiPo cell voltage, roughly."""
+    if not mv:
+        return 'n/a'
+    return f'{mv} mV ({max(0, min(100, round((mv - 3000) / 1200 * 100)))}%)'
+
+
+def duration_text(secs: int) -> str:
+    d, rest = divmod(int(secs), 86400)
+    h, rest = divmod(rest, 3600)
+    m, s = divmod(rest, 60)
+    return (f'{d}d ' if d else '') + f'{h}h {m:02d}m {s:02d}s'
+
+
+class RepeaterMixin:
+    NO_REPLY = ['no reply (timed out)',
+                'The node may be out of range, busy, or it may only share this after a login.']
+
+    async def repeater_status(self, c: dict) -> list[str]:
+        async with self.radio_lock:
+            p = await self.mc.commands.req_status_sync(c, min_timeout=15)
+        if not p:
+            return self.NO_REPLY
+        self.node_stats[c['public_key'][:12]] = (int(time.time()), p)
+        rows = [('Uptime', duration_text(p.get('uptime', 0))),
+                ('Battery', battery_text(p.get('bat'))),
+                ('Noise floor', f'{p.get("noise_floor", "?")} dB'),
+                ('Last RSSI / SNR', f'{p.get("last_rssi", "?")} dBm / {p.get("last_snr", "?")} dB'),
+                ('TX queue', str(p.get('tx_queue_len', '?'))),
+                ('Packets rx / tx', f'{p.get("nb_recv", "?")} / {p.get("nb_sent", "?")}'),
+                ('Flood rx / tx', f'{p.get("recv_flood", "?")} / {p.get("sent_flood", "?")}'),
+                ('Direct rx / tx', f'{p.get("recv_direct", "?")} / {p.get("sent_direct", "?")}')]
+        if p.get('recv_errors') is not None:
+            rows.append(('Receive errors', str(p['recv_errors'])))
+        return [f'{a + ":":<18}{b}' for a, b in rows]
+
+    async def repeater_telemetry(self, c: dict) -> list[str]:
+        async with self.radio_lock:
+            lpp = await self.mc.commands.req_telemetry_sync(c, min_timeout=15)
+        if lpp is None:
+            return self.NO_REPLY
+        if not lpp:
+            return ['The node shares no telemetry.']
+        out = []
+        for e in lpp:
+            if isinstance(e, dict) and 'type' in e:
+                unit = {'temperature': ' °C', 'voltage': ' V', 'humidity': ' %', 'barometer': ' hPa',
+                        'luminosity': ' lux', 'current': ' A', 'power': ' W'}.get(str(e['type']), '')
+                val = e.get('value')
+                if isinstance(val, dict):
+                    val = ', '.join(f'{k} {v}' for k, v in val.items())
+                out.append(f'{str(e["type"]).replace("_", " ").capitalize() + ":":<18}{val}{unit}'
+                           f'   (channel {e.get("channel", "?")})')
+            else:
+                out.append(str(e))
+        return out
+
+    async def repeater_neighbours(self, c: dict) -> list[str]:
+        async with self.radio_lock:
+            res = await self.mc.commands.fetch_all_neighbours(c, pubkey_prefix_length=8)
+        if not res:
+            return self.NO_REPLY
+        ns = res.get('neighbours', [])
+        if not ns:
+            return ['The node reports no neighbours.']
+        out = [f'{"Node":<26}{"SNR":>8}  Last heard']
+        for n in sorted(ns, key=lambda x: x['secs_ago']):
+            hit = next((v for v in self.contacts().values() if v['public_key'].startswith(n['pubkey'])), None)
+            who = (hit or {}).get('adv_name') or n['pubkey']
+            ago = n['secs_ago']
+            out.append(f'{who[:25]:<26}{n["snr"]:>5} dB  {ago // 60}m{ago % 60:02d}s ago')
+        return out
+
+    COMMAND_HELP = (
+        'After logging in, the lines you type in a repeater chat are sent to it as commands and its',
+        'answers appear in the same chat. Typical commands (the set depends on the firmware version,',
+        'see the MeshCore documentation):',
+        '',
+        '  ver                   firmware version',
+        '  clock                 show the clock;  clock sync  sets it from this computer',
+        '  get name | radio | tx | lat | lon     read a setting',
+        '  set name <x> | lat <x> | lon <x> ...  change a setting',
+        '  advert                send an advert now',
+        '  neighbors             list heard neighbours',
+        '  password <new>        change the admin password',
+        '  reboot                restart the node',
+        '',
+        'Room servers do not take commands: after logging in you can post to them normally.',
+    )
+
+    def ask_login(self, c: dict):
+        name = c.get('adv_name', '?')
+        ask = {'label': f'Password for {name} (empty = guest login)', 'text': '', 'secret': True,
+               'check': False, 'check_label': 'Remember this password (stored unencrypted, mode 0600)',
+               'contact': c}
+        ask['cb'] = lambda text, contact: self.apply_login(text, contact, remember=ask['check'])
+        self.ask = ask
+        self.dirty = True
+
+    async def apply_login(self, password: str, c: dict, saved: bool = False, remember: bool = False):
+        if not self.need_radio():
+            return
+        name, key = c.get('adv_name', '?'), c['public_key'][:12]
+        self.status = f'logging in to {name}...'
+        self.dirty = True
+        async with self.radio_lock:
+            ev = await self.mc.commands.send_login_sync(c, password, min_timeout=15)
+        if ev is None or ev.type != EventType.LOGIN_SUCCESS:
+            self.status = (f'login to {name} failed with the saved password: forget it from the menu if it changed'
+                           if saved else f'login to {name} failed (no answer, or wrong password)')
+            return
+        self.admin.add(key)
+        role = 'admin' if ev.payload.get('is_admin') else 'guest'
+        self.select(('d', key))
+        self.note(f'logged in to {name} as {role}.'
+                  + (' Lines you type are sent as commands (see Commands in the menu).' if c.get('type') == 2 else ''))
+        self.status = f'logged in to {name} as {role}'
+        if c.get('type') == 2:
+            self.focus = 'input'
+        if password and remember and not saved and self.passwords.get(key) != password:
+            self.passwords[key] = password
+            self.store_passwords()
+            self.status = f'logged in to {name} as {role}; password saved'
+
+    async def apply_logout(self, c: dict):
+        key = c['public_key'][:12]
+        self.admin.discard(key)
+        if self.mc:
+            async with self.radio_lock:
+                await self.mc.commands.send_logout(c)
+        self.status = f'logged out of {c.get("adv_name", "?")}'
+
+    async def send_admin(self, text: str):
+        """A line typed in a repeater chat goes out as a CLI command."""
+        c = self.selected_contact()
+        if c is None or not self.need_radio():
+            return
+        if c['public_key'][:12] not in self.admin:
+            self.status = 'log in first: Enter on the repeater, then "Log in"'
+            return
+        now = int(datetime.now().timestamp())
+        msg = Msg(now, 'me', text, mine=True, recv=now)
+        self.add(self.selected, msg)
+        async with self.radio_lock:
+            r = await self.mc.commands.send_cmd(c, text, now)
+        if r.type == EventType.ERROR:
+            msg.status = 'failed'
+            self.status = f'command not sent: {describe_error(r.payload)}'
+        else:
+            msg.status = 'sent'
+            self.status = 'command sent, waiting for the answer...'
+        self.dirty = True
+
+    async def repeater_owner(self, c: dict) -> list[str]:
+        async with self.radio_lock:
+            res = await self.mc.commands.req_owner_sync(c, min_timeout=15)
+        if not res:
+            return self.NO_REPLY
+        rows = [('Node name', res.get('name') or '-')]
+        out = [f'{a + ":":<14}{b}' for a, b in rows]
+        owner = (res.get('owner') or '').strip()
+        out += ['Owner info:'] + ([f'  {l}' for l in owner.splitlines()] if owner else ['  (none set)'])
+        return out
+
+    async def repeater_regions(self, c: dict) -> list[str]:
+        async with self.radio_lock:
+            res = await self.mc.commands.req_regions_sync(c, min_timeout=15)
+        if res is None:
+            return self.NO_REPLY
+        regions = [r for r in res.replace(',', '\n').split() if r]
+        return regions or ['The node reports no regions.']
+
+    async def repeater_clock(self, c: dict) -> list[str]:
+        """The repeater's own clock, from the anonymous 'basic' request (no login needed)."""
+        t0 = time.time()
+        async with self.radio_lock:
+            res = await self.mc.commands.req_basic_sync(c, min_timeout=15)
+        if not res or not res.get('data'):
+            return self.NO_REPLY
+        raw = bytes.fromhex(res['data'])
+        words = [int.from_bytes(raw[i:i + 4], 'little') for i in range(0, len(raw) - 3, 4)]
+        ok = lambda w: 1_700_000_000 <= w <= 4_100_000_000      # a plausible unix time (2023..2100)
+        # the reply starts with the echoed request tag; the clock follows it
+        stamp = next((w for w in words[1:2] + words[:1] if ok(w)), None)
+        out = []
+        if stamp is None:
+            out.append('The reply holds no recognisable clock value.')
+            out.append('If you can log in, the command "clock" asks the repeater directly.')
+        else:
+            off = stamp - t0
+            local = datetime.fromtimestamp(stamp)
+            utc = datetime.fromtimestamp(stamp, tz=timezone.utc)
+            out += [f'{"Repeater clock:":<18}{local:%Y-%m-%d %H:%M:%S} (local)',
+                    f'{"":<18}{utc:%H:%M:%S} UTC',
+                    f'{"This computer:":<18}{datetime.fromtimestamp(t0):%Y-%m-%d %H:%M:%S}',
+                    f'{"Difference:":<18}' + ('within a few seconds' if abs(off) < 5 else
+                                              f'{abs(off):.0f} s {"ahead" if off > 0 else "behind"}'
+                                              + (f' (about {abs(off) / 60:.0f} min)' if abs(off) >= 120 else ''))]
+        out += ['', f'raw reply: {raw.hex()}']
+        return out
+
+    @staticmethod
+    def load_passwords() -> dict:
+        try:
+            with open(PASSWORDS_FILE) as f:
+                data = json.load(f)
+            return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)}
+        except (OSError, ValueError, AttributeError):
+            return {}
+
+    def store_passwords(self):
+        """Write the remembered passwords; the file is created readable by this user only."""
+        try:
+            os.makedirs(os.path.dirname(PASSWORDS_FILE), exist_ok=True)
+            tmp = PASSWORDS_FILE + '.tmp'
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w') as f:
+                json.dump(self.passwords, f, indent=2)
+            os.replace(tmp, PASSWORDS_FILE)
+        except OSError as e:
+            log.warning('could not save passwords: %s', e)
+
+    def forget_password(self, c: dict):
+        if self.passwords.pop(c['public_key'][:12], None) is not None:
+            self.store_passwords()
+            self.status = f'forgot the saved password for {c.get("adv_name", "?")}'
+
+
+# ======================================================================
+# connection
+# ======================================================================
+
+class ConnectionMixin:
+    async def toggle_connection(self):
+        if self.connecting:
+            return
+        if self.mc:
+            await self.disconnect()
+        else:
+            self.connect_to()
+
+    def start_auto_connect(self):
+        self.connect_to()
+
+    def connect_to(self):
+        self.connecting = True
+        self.status = 'connecting to local radio...'
+        self.dirty = True
+        asyncio.create_task(self.connect())
+
+    async def connect(self):
+        mc = None
+        try:
+            self.status = 'starting local radio...'
+            self.dirty = True
+            self.local = LocalRadio()
+            await self.local.start()
+            mc = MeshCore(TCPConnection(HOST, PORT))
+            await mc.connect()
+            if mc.self_info is None:
+                raise RuntimeError('no response from radio')
+            self.mc = mc
+            # announce protocol v3: the radio then reports SNR with each received message
+            r = await mc.commands.send_device_query()
+            log.info('device query: %s', 'ok' if r.type != EventType.ERROR else describe_error(r.payload))
+            await self.load()
+            await self.sync_radio_clock()
+            await self.refresh_battery()
+            mc.subscribe(EventType.CONTACT_MSG_RECV, self.on_contact_msg)
+            mc.subscribe(EventType.CHANNEL_MSG_RECV, self.on_chan_msg)
+            mc.subscribe(EventType.ACK, self.on_ack)
+            mc.subscribe(EventType.RX_LOG_DATA, self.on_rx_log)
+            for ev in (EventType.NEW_CONTACT, EventType.ADVERTISEMENT, EventType.PATH_UPDATE):
+                mc.subscribe(ev, self.on_contacts_changed)
+            await self.log_autoadd_config()
+            mc.subscribe(EventType.DISCONNECTED, self.on_disconnected)
+            await mc.start_auto_message_fetching()
+            await self.drain_queue(mc)
+            self.save_config()
+            self.status = f'connected to {self.target()}'
+        except BaseException as e:
+            self.mc = None
+            if mc is not None:
+                try:
+                    await mc.disconnect()
+                except Exception:
+                    pass
+            await self.stop_local()
+            if isinstance(e, asyncio.CancelledError):
+                raise
+            self.status = f'connect failed: {str(e) or type(e).__name__}'
+        finally:
+            self.connecting = False
+            self.dirty = True
+
+    async def disconnect(self, reason: str = 'disconnected'):
+        mc, self.mc = self.mc, None
+        if mc is None:
+            await self.stop_local()
+            return
+        self.contact_cache = dict(mc.contacts)
+        self.pending_acks.clear()
+        self.admin.clear()
+        self.status = reason
+        self.dirty = True
+        try:
+            await mc.disconnect()
+        except Exception:
+            pass
+        await self.stop_local()
+
+    async def stop_local(self):
+        local, self.local = getattr(self, 'local', None), None
+        if local is not None:
+            await local.stop()
+
+    async def on_disconnected(self, event):
+        # device unplugged / link lost; skip our own manual disconnect
+        if self.mc is not None:
+            asyncio.create_task(self.disconnect('connection lost'))
+
+    async def load_channels(self) -> int | None:
+        """Refresh self.channels from the radio; returns the first free slot, if any."""
+        chans, free = [], None
+        for idx in range(MAX_CHANNELS):
+            async with self.radio_lock:
+                r = await self.mc.commands.get_channel(idx)
+            if r.type == EventType.ERROR:
+                break
+            name = r.payload.get('channel_name', '')
+            if name:
+                chans.append((idx, name))
+                sec = r.payload.get('channel_secret')
+                if sec:
+                    self.chan_secrets[idx] = sec.hex() if isinstance(sec, (bytes, bytearray)) else str(sec)
+            elif free is None:
+                free = idx
+        self.channels = chans
+        self.dirty = True
+        return free
+
+    async def create_channel(self, arg: str):
+        """/channel <name> [secret-hex]: #name = public hashtag channel, otherwise private."""
+        if not self.need_radio():
+            return
+        parts = arg.split()
+        if not parts or len(parts) > 2:
+            self.status = 'usage: /channel <name> [32-hex-char secret]'
+            return
+        name = parts[0]
+        if len(name.encode()) > 31:
+            self.status = 'channel name too long (max 31 bytes)'
+            return
+        secret = None
+        if len(parts) == 2:
+            try:
+                secret = bytes.fromhex(parts[1])
+            except ValueError:
+                secret = b''
+            if len(secret) != 16:
+                self.status = 'secret must be 32 hex characters (16 bytes)'
+                return
+        elif not name.startswith('#'):
+            secret = os.urandom(16)          # private channel: random key, share it by hand
+        if any(n == name for _, n in self.channels):
+            self.status = f'channel {name} already exists'
+            return
+        free = await self.load_channels()
+        if free is None:
+            self.status = 'no free channel slot on the radio'
+            return
+        async with self.radio_lock:
+            r = await self.mc.commands.set_channel(free, name, secret)
+        if r.type == EventType.ERROR:
+            self.status = f'create channel failed: {describe_error(r.payload)}'
+            return
+        await self.load_channels()
+        self.select(('c', free))
+        if name.startswith('#'):
+            self.note(f'joined public channel {name} (slot {free})')
+        else:
+            self.note(f'created channel {name} (slot {free}); secret: '
+                      f'{secret.hex() if secret else "derived from name"}')
+        self.status = f'channel {name} created'
+
+    async def load(self):
+        async with self.radio_lock:
+            await self.mc.ensure_contacts()
+        await self.load_channels()
+        if self.selected is None and (e := self.entries()):
+            self.select(e[0][0])
+        self.dirty = True
+
+    async def on_contacts_changed(self, event):
+        # the library only marks its contact table dirty on adverts; fetch the new entries
+        mc = self.mc
+        if mc is not None:
+            log.info('%s: %s', event.type.value, str(event.payload.get('public_key', ''))[:12])
+            try:
+                async with self.radio_lock:
+                    await mc.ensure_contacts(follow=True)
+            except Exception as e:
+                log.warning('contact refresh failed: %s', e)
+        self.dirty = True
+
+    async def log_autoadd_config(self):
+        try:
+            r = await self.mc.commands.get_autoadd_config()
+            log.info('autoadd config: %s', r.payload)
+        except Exception as e:
+            log.info('autoadd config unavailable: %s', e)
+
+    async def drain_queue(self, mc):
+        """Fetch everything the radio queued while we were away (the library fetches only one)."""
+        n = 0
+        for _ in range(200):
+            async with self.radio_lock:
+                r = await mc.commands.get_msg()
+            if r.type in (EventType.NO_MORE_MSGS, EventType.ERROR):
+                break
+            n += 1
+            await asyncio.sleep(0.05)
+        if n:
+            log.info('fetched %d queued message(s)', n)
+
+    async def pick_device(self):
+        if self.mc:
+            await self.disconnect()
+        self.connect_to()
+
+    async def reload(self):
+        if self.need_radio():
+            self.status = 'reloading...'
+            async with self.radio_lock:      # load_channels takes the lock itself, so only the contacts here
+                await self.mc.commands.get_contacts()
+            await self.load_channels()
+            self.dirty = True
+            self.status = f'connected to {self.target()}'
+
+# ======================================================================
+# messaging
+# ======================================================================
+
+class MessagingMixin:
+    def on_contact_msg(self, event):
+        p = event.payload
+        prefix = p.get('pubkey_prefix', '')[:12]
+        c = self.mc.get_contact_by_key_prefix(prefix) if prefix else None
+        who = c['adv_name'] if c else prefix[:8]
+        self.add(('d', prefix), Msg(p.get('sender_timestamp', 0), who, p.get('text', ''),
+                                    recv=int(datetime.now().timestamp()), info=dict(p)))
+
+    def on_chan_msg(self, event):
+        p = event.payload
+        # channel text already arrives as "sender: message"
+        key = ('c', p.get('channel_idx', 0))
+        msg = Msg(p.get('sender_timestamp', 0), '', p.get('text', ''),
+                  recv=int(datetime.now().timestamp()), info=dict(p))
+        if self.is_blocked(key, self.sender_of(msg)):
+            return
+        self.add(key, msg)
+
+    def on_ack(self, event):
+        m = self.pending_acks.pop(event.payload.get('code', ''), None)
+        if m:
+            m.status = 'acked'
+            self.dirty = True
+
+    async def send(self, text: str):
+        key = self.selected
+        if key in (RX_KEY, LOG_KEY):
+            self.status = 'this view is read-only: pick a channel or contact to send'
+            return
+        if key is None or not text or not self.need_radio():
+            return
+        c = self.selected_contact()
+        if c and c.get('type') == 2:                 # repeaters take commands, not chat
+            await self.send_admin(text)
+            return
+        now = int(datetime.now().timestamp())
+        msg = Msg(now, 'me', text, mine=True, recv=now)
+        self.add(key, msg)
+        await self.deliver(key, msg)
+
+    async def transmit(self, key: tuple, msg: Msg, contact: dict | None, attempt: int = 0):
+        """One send to the radio; retried when the radio rejects it (busy / queue full)."""
+        async with self.radio_lock:
+            for n in range(self.retries + 1):
+                if key[0] == 'c':
+                    r = await self.mc.commands.send_chan_msg(key[1], msg.text, msg.ts)
+                else:
+                    r = await self.mc.commands.send_msg(contact, msg.text, msg.ts, attempt)
+                if r.type != EventType.ERROR:
+                    break
+                log.warning('send attempt %d to %s failed: %s %s', n + 1,
+                            self.name_for(key), describe_error(r.payload), r.payload)
+                if n < self.retries:
+                    await asyncio.sleep(1)
+        return r
+
+    def expect_ack(self, msg: Msg, payload: dict):
+        code = payload.get('expected_ack')
+        if code:
+            self.pending_acks[code if isinstance(code, str) else code.hex()] = msg
+
+    async def deliver(self, key: tuple, msg: Msg):
+        contact = None
+        if key[0] == 'd':
+            contact = self.mc.get_contact_by_key_prefix(key[1])
+            if contact is None:
+                msg.status = 'failed'
+                self.status = 'unknown contact'
+                self.dirty = True
+                return
+        r = await self.transmit(key, msg, contact)
+        if r.type in (EventType.MSG_SENT, EventType.OK):      # channel sends are answered with a plain OK
+            msg.status = 'sent'
+            msg.info = dict(r.payload)
+            if key[0] == 'd':
+                self.expect_ack(msg, r.payload)
+                if self.retries:
+                    asyncio.create_task(self.guarded(self.watch_ack(key, msg)))
+        else:
+            msg.status = 'failed'
+            self.status = f'send failed: {describe_error(r.payload)}'
+        self.dirty = True
+
+    async def watch_ack(self, key: tuple, msg: Msg):
+        """Resend an unacknowledged direct message up to `retries` times, then mark it failed."""
+        for attempt in range(self.retries + 1):
+            wait = msg.info.get('suggested_timeout', 10000) / 1000 + 2
+            for _ in range(int(wait * 2)):
+                await asyncio.sleep(0.5)
+                if msg.status != 'sent' or self.mc is None:
+                    return
+            if attempt == self.retries:
+                break
+            contact = self.mc.get_contact_by_key_prefix(key[1])
+            if contact is None:
+                break
+            self.status = f'no ack from {contact.get("adv_name", "?")}, retry {attempt + 1}/{self.retries}'
+            self.dirty = True
+            r = await self.transmit(key, msg, contact, attempt + 1)
+            if r.type == EventType.ERROR:
+                break
+            msg.info.update(r.payload)
+            self.expect_ack(msg, r.payload)
+        if msg.status == 'sent':
+            msg.status = 'failed'
+            self.status = 'no acknowledgement received'
+            self.dirty = True
+
+    def do_search(self, q: str):
+        if not q:
+            self.status = 'usage: /search <text>'
+            return
+        hits = []
+        for key, msgs in self.history.items():
+            if not key or key in (RX_KEY, LOG_KEY):
+                continue
+            for i, m in enumerate(msgs):
+                if q.lower() in m.text.lower():
+                    hits.append((m.recv or m.ts, key, i, m))
+        hits.sort(key=lambda h: -h[0])
+        if not hits:
+            self.status = f'no messages match "{q}"'
+            return
+        self.search = {'q': q, 'hits': hits[:200], 'sel': 0, 'total': len(hits)}
+
+    def handle_search_key(self, k):
+        sr = self.search
+        n = len(sr['hits'])
+        if k in ('\x1b', 'q'):
+            self.search = None
+        elif k == curses.KEY_UP:
+            sr['sel'] = max(0, sr['sel'] - 1)
+        elif k == curses.KEY_DOWN:
+            sr['sel'] = min(n - 1, sr['sel'] + 1)
+        elif k == curses.KEY_PPAGE:
+            sr['sel'] = max(0, sr['sel'] - 10)
+        elif k == curses.KEY_NPAGE:
+            sr['sel'] = min(n - 1, sr['sel'] + 10)
+        elif k == '\n':
+            _, key, i, _m = sr['hits'][sr['sel']]
+            self.search = None
+            self.select(key)
+            self.focus, self.msg_sel = 'msgs', i
+        elif isinstance(k, str) and len(k) == 1 and ord(k) in (CTRL_Q, CTRL_C):
+            self.quit = True
+        self.dirty = True
+
+    def draw_search(self, scr, h, w):
+        sr = self.search
+        bw = min(w - 2, 78)
+        bh = min(h - 2, len(sr['hits']) + 3)
+        y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+        for y in range(bh):
+            scr.addstr(y0 + y, x0, ' ' * bw, theme_REV)
+        shown = len(sr['hits'])
+        more = f' (first {shown} of {sr["total"]})' if sr['total'] > shown else ''
+        scr.addnstr(y0, x0 + 1, f'Search "{sr["q"]}": {sr["total"]} match(es){more}', bw - 2, theme_REV | curses.A_BOLD)
+        rows = bh - 3
+        top = max(0, min(sr['sel'] - rows // 2, shown - rows))
+        for i, (_, key, _idx, m) in enumerate(sr['hits'][top:top + rows]):
+            who = f'{self.name_for(key)}: ' if key else ''
+            line = f'{hhmm(m.recv or m.ts)} {who}{m.who + ": " if m.who and m.who != "me" else ""}{m.text}'
+            attr = theme_SEL if top + i == sr['sel'] else theme_REV
+            scr.addnstr(y0 + 1 + i, x0 + 1, line.replace('\n', ' ').ljust(bw - 2), bw - 2, attr)
+        scr.addnstr(y0 + bh - 1, x0 + 1, 'Enter jump to message · Esc close', bw - 2, theme_REV | curses.A_DIM)
+        curses.curs_set(0)
+
+    def message_details(self, m: Msg) -> list[str]:
+        key = self.selected
+        info = m.info
+        fmt = lambda t: datetime.fromtimestamp(t).strftime('%Y-%m-%d %H:%M:%S') if t else '-'
+        rows: list[tuple[str, str]] = []
+        me = (self.mc.self_info or {}).get('name', 'me') if self.mc else 'me'
+        text = m.text
+        if key and key[0] == 'c':
+            chan = self.name_for(key)
+            if m.mine:
+                rows += [('From', f'{me} (you)'), ('To', f'channel {chan}')]
+            else:
+                sender, sep, rest = text.partition(': ')
+                if sep:
+                    rows.append(('From', sender))
+                    text = rest
+                rows.append(('Channel', f'{chan} (slot {key[1]})'))
+        elif key:
+            c = next((v for k2, v in self.contacts().items() if k2.startswith(key[1])), None)
+            peer = self.name_for(key)
+            if m.mine:
+                rows += [('From', f'{me} (you)'), ('To', peer)]
+            else:
+                rows.append(('From', peer))
+            rows.append(('Key', c['public_key'] if c else key[1]))
+            if c:
+                rows.append(('Node type', NODE_TYPES.get(c.get('type'), '?')))
+        if m.mine:
+            rows.append(('Sent', fmt(m.ts)))
+            rows.append(('Status', {'sent': 'sent to radio (no ack yet)',
+                                    'acked': 'delivered (ack received)',
+                                    'failed': 'failed (press r in the message list to resend)'}.get(m.status, m.status or '-')))
+        elif m.info:
+            rows.append(('Sent (sender clock)', fmt(info.get('sender_timestamp', 0))))
+            rows.append(('Received', fmt(m.recv)))
+            plen = info.get('path_len')
+            if plen is not None:
+                rows.append(('Route', 'direct' if plen == 255 else f'{plen} hop(s)'))
+            for label, k, unit in (('SNR', 'SNR', ' dB'), ('RSSI', 'RSSI', ' dBm')):
+                if k in info:
+                    rows.append((label, f'{info[k]}{unit}'))
+            if info.get('path'):
+                rows.append(('Path', info['path']))
+            if 'txt_type' in info:
+                rows.append(('Text type', {0: 'plain', 1: 'command', 2: 'signed'}.get(
+                    info['txt_type'], str(info['txt_type']))))
+        else:
+            rows.append(('Note', 'local message (not from the radio)'))
+        out = [f'{a + ":":<22}{b}' for a, b in rows]
+        out += ['', 'Message:']
+        out += textwrap.wrap(text, 64) or ['']
+        return out
+
+    def handle_msg_focus_key(self, k) -> bool:
+        """Keys while the message list has focus; returns False to fall through to the input."""
+        msgs = self.history.get(self.selected, [])
+        page = max(1, self.last_body_h // 2)
+        if k == '\t':
+            self.focus = 'side'
+        elif k == '\x1b':
+            self.focus = 'input'
+        elif k == curses.KEY_UP:
+            self.msg_sel = max(0, self.msg_sel - 1)
+        elif k == curses.KEY_DOWN:
+            self.msg_sel = min(len(msgs) - 1, self.msg_sel + 1)
+        elif k == curses.KEY_PPAGE:
+            self.msg_sel = max(0, self.msg_sel - page)
+        elif k == curses.KEY_NPAGE:
+            self.msg_sel = min(len(msgs) - 1, self.msg_sel + page)
+        elif k == curses.KEY_HOME:
+            self.msg_sel = 0
+        elif k == curses.KEY_END:
+            self.msg_sel = len(msgs) - 1
+        elif k in ('r', 'R') and msgs and msgs[self.msg_sel].mine and \
+                msgs[self.msg_sel].status == 'failed' and self.selected not in (RX_KEY, LOG_KEY):
+            if self.need_radio():
+                m = msgs[self.msg_sel]
+                m.status = ''
+                self.status = 'resending...'
+                asyncio.create_task(self.guarded(self.deliver(self.selected, m)))
+        elif k == '\n' and msgs:
+            if self.selected == RX_KEY:
+                self.show_packet(msgs[self.msg_sel].info)
+            elif self.selected == LOG_KEY:
+                m = msgs[self.msg_sel]
+                self.show('Log entry', [f'Time: {datetime.fromtimestamp(m.ts):%Y-%m-%d %H:%M:%S}', ''] +
+                          (textwrap.wrap(m.text, 64) or ['']))
+            else:
+                self.show('Message details', self.message_details(msgs[self.msg_sel]))
+        elif isinstance(k, str) and (k.isprintable() or k == '\x7f'):
+            self.focus = 'input'          # start typing: back to the input line
+            return False
+        else:
+            return False
+        self.dirty = True
+        return True
+
+    def draw_details(self, scr, h, w):
+        room = h - 4
+        self.details_scroll = max(0, min(self.details_scroll, len(self.details) - room))
+        rows = self.details[self.details_scroll:self.details_scroll + room]
+        more = len(self.details) > room
+        bw = min(w - 2, 78)
+        bh = len(rows) + 3
+        y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+        for y in range(bh):
+            scr.addstr(y0 + y, x0, ' ' * bw, theme_REV)
+        scr.addnstr(y0, x0 + 1, self.details_title, bw - 2, theme_REV | curses.A_BOLD)
+        verdicts = self.details_title.startswith(('Trace', 'Ping', 'Route'))
+        for i, line in enumerate(rows):
+            scr.addnstr(y0 + 1 + i, x0 + 1, line, bw - 2,
+                        theme_result_attr(line, theme_REV) if verdicts else theme_REV)
+        scr.addnstr(y0 + bh - 1, x0 + 1,
+                    ('↑/↓ scroll · any other key closes' if more else 'press any key to close')
+                    + (' (back to the menu)' if self.details_back else ''), bw - 2,
+                    theme_REV | curses.A_DIM)
+        curses.curs_set(0)
+
+    def show_packet(self, p: dict):
+        """Details window for one RX log packet."""
+        ts = p.get('recv_time')
+        path, size = p.get('path', ''), p.get('path_hash_size', 1) or 1
+        rows = [('Time', datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts else '-'),
+                ('Type', p.get('payload_typename', '?')),
+                ('Route type', p.get('route_typename', '?')),
+                ('RSSI', f'{p["rssi"]} dBm' if 'rssi' in p else '-'),
+                ('SNR', f'{p["snr"]} dB' if 'snr' in p else '-'),
+                ('Length', f'{p.get("payload_length", "-")} bytes')]
+        n = p.get('path_len', 0)
+        if p.get('payload_typename') == 'TRACE':
+            rows.append(('Hop SNRs', ' > '.join(f'{(int(path[i:i + 2], 16) - (256 if int(path[i:i + 2], 16) > 127 else 0)) / 4:.2f}'
+                                                for i in range(0, len(path), 2)) or '-'))
+        else:
+            hops = [path[i:i + size * 2] for i in range(0, len(path), size * 2)]
+            rows.append(('Path', (f'{n} hop(s): ' + ' > '.join(self.hop_name(h) for h in hops)) if hops
+                         else 'direct' if n == 0 else f'{n} hop(s)'))
+        if p.get('transport_code'):
+            rows.append(('Transport code', p['transport_code']))
+        if 'pkt_hash' in p:
+            rows.append(('Packet hash', str(p['pkt_hash'])))
+        if p.get('payload_typename') == 'ADVERT':
+            key = p.get('adv_key', '')
+            c = next((v for v in self.contacts().values() if key and v['public_key'] == key), None)
+            rows += [('Advert from', p.get('adv_name') or (c or {}).get('adv_name') or '?'),
+                     ('Public key', key),
+                     ('Node type', NODE_TYPES.get(p.get('adv_type'), str(p.get('adv_type', '?'))))]
+            if p.get('adv_timestamp'):
+                rows.append(('Advert time', datetime.fromtimestamp(p['adv_timestamp']).strftime('%Y-%m-%d %H:%M:%S')))
+            if p.get('adv_lat') or p.get('adv_lon'):
+                rows.append(('Position', f'{p.get("adv_lat", 0):.5f}, {p.get("adv_lon", 0):.5f}'))
+                if dist := self.distance_text(p.get('adv_lat', 0), p.get('adv_lon', 0)):
+                    rows.append(('Distance', dist))
+        for k, label in (('chan_name', 'Channel'), ('message', 'Message'), ('sender_timestamp', 'Sender time'),
+                         ('attempt', 'Attempt'), ('chan_hash', 'Channel hash'), ('cipher_mac', 'MAC')):
+            if k in p:
+                rows.append((label, str(p[k])))
+        if p.get('payload'):
+            rows.append(('Raw', p['payload']))
+        out = []
+        for a, b in rows:
+            lines = textwrap.wrap(str(b), 52, break_long_words=True) or ['']
+            out.append(f'{a + ":":<16}{lines[0]}')
+            out += [' ' * 16 + l for l in lines[1:]]
+        self.show('Packet', out)
+
+    def on_rx_log(self, event):
+        p = event.payload
+        ptype = p.get('payload_typename', '?')
+        path = p.get('path', '')
+        hops = []
+        if ptype == 'TRACE':        # path bytes are per-hop SNR, quarter-dB steps
+            hops = [f'{(int(path[i:i + 2], 16) - (256 if int(path[i:i + 2], 16) > 127 else 0)) / 4:.2f}dB'
+                    for i in range(0, len(path), 2)]
+        elif ptype != 'ACK':
+            hops = [self.hop_name(path[i:i + 2]) for i in range(0, len(path), 2)]
+        extra = ''
+        if ptype == 'ADVERT' and p.get('adv_key'):
+            self.signal[p['adv_key'][:12]] = (int(datetime.now().timestamp()), p.get('snr'),
+                                              p.get('rssi'), 'advert')
+        if ptype == 'ADVERT':
+            key = p.get('adv_key', '')
+            c = self.mc.get_contact_by_key_prefix(key[:8]) if self.mc and key else None
+            extra = f'  from {p.get("adv_name") or (c or {}).get("adv_name") or key[:8] or "?"}'
+        elif ptype == 'ACK':
+            extra = f'  ack {path}'
+        if hops:
+            extra += '  path ' + ' > '.join(hops)
+        now = int(datetime.now().timestamp())
+        self.add(RX_KEY, Msg(now, '', f'{ptype:<9} rssi {p.get("rssi", "?"):>4} '
+                             f'snr {p.get("snr", "?"):>5}{extra}', recv=now, info=dict(p)), unread=False)
+
+    def render_lines(self, width: int) -> list[tuple[str, int, int]]:
+        lines = []
+        for n, m in enumerate(self.history.get(self.selected, [])):
+            mark = {'sent': ' ·', 'acked': ' ✓', 'failed': ' ✗'}.get(m.status, '')
+            body = f'{m.who}: {m.text}' if m.who else m.text
+            prefix = f'{hhmm(m.ts)} '
+            attr = (theme_NOTE if m.who == '*' else theme_FAIL if m.status == 'failed'
+                    else theme_ME if m.mine else curses.A_NORMAL)
+            wrapped = textwrap.wrap(body + mark, max(10, width - len(prefix)),
+                                    subsequent_indent='  ') or ['']
+            for i, w in enumerate(wrapped):
+                lines.append(((prefix if i == 0 else ' ' * len(prefix)) + w, attr, n))
+        return lines
+
+
+# ======================================================================
+# settings
+# ======================================================================
+
+class SettingsMixin:
+    SETTINGS = ('info', 'autoconnect', 'name', 'tx_power', 'location', 'clock', 'advert', 'reboot', 'auto_add', 'repeaters', 'retries', 'theme')
+
+    def setting_rows(self) -> list[tuple[str, str]]:
+        si = (self.mc.self_info if self.mc else None) or {}
+        onoff = lambda b: 'on' if b else 'off'
+        dash = lambda k: str(si[k]) if k in si else '-'
+        return [
+            ('This radio', 'public key, firmware, battery...'),
+            ('Connect on startup', onoff(self.auto_connect)),
+            ('Device name', dash('name')),
+            ('TX power (dBm)', dash('tx_power')),
+            ('Location (lat, lon)', self.my_position_text()),
+            ('Set radio clock', 'to this computer\'s time'),
+            ('Send advert', 'zero hop / flood...'),
+            ('Reboot radio', 'asks first'),
+            ('Auto add discovered contacts',
+             onoff(not si['manual_add_contacts']) if 'manual_add_contacts' in si else '-'),
+            ('Show repeaters in list', onoff(self.show_repeaters)),
+            ('Send retries', str(self.retries)),
+            ('Colour theme', self.theme),
+        ]
+
+    def my_position(self) -> tuple[float, float] | None:
+        si = (self.mc.self_info if self.mc else None) or {}
+        lat, lon = si.get('adv_lat') or 0, si.get('adv_lon') or 0
+        return (lat, lon) if lat or lon else None
+
+    def my_position_text(self) -> str:
+        if not self.mc:
+            return '-'
+        pos = self.my_position()
+        return f'{pos[0]:.5f}, {pos[1]:.5f}' if pos else 'not set'
+
+    @staticmethod
+    def parse_position(text: str) -> tuple[float, float] | None:
+        text = text.strip().lower()
+        if text in ('none', 'clear', '0'):
+            return 0.0, 0.0
+        try:
+            lat, lon = (float(x) for x in text.replace(',', ' ').split())
+        except ValueError:
+            return None
+        return (lat, lon) if -90 <= lat <= 90 and -180 <= lon <= 180 else None
+
+    def distance_text(self, lat: float, lon: float) -> str | None:
+        """'12.3 km NE' from our own position to (lat, lon); None when either is unknown."""
+        me = self.my_position()
+        if not me or not (lat or lon):
+            return None
+        p1, p2 = math.radians(me[0]), math.radians(lat)
+        dl = math.radians(lon - me[1])
+        a = math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+        km = 12742 * math.asin(math.sqrt(a))
+        brg = math.degrees(math.atan2(math.sin(dl) * math.cos(p2),
+                                      math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)))
+        compass = ('N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW')[round(brg % 360 / 45) % 8]
+        dist = f'{km * 1000:.0f} m' if km < 1 else f'{km:.1f} km' if km < 100 else f'{km:.0f} km'
+        return f'{dist} {compass}'
+
+    async def sync_radio_clock(self, force: bool = False):
+        """Put the companion radio's clock on this computer's time. The radio stamps adverts and
+        commands (such as a repeater's `clock sync`) with its own clock, so a wrong one spreads."""
+        try:
+            async with self.radio_lock:
+                r = await self.mc.commands.get_time()
+                if r.type == EventType.ERROR:
+                    log.warning('radio clock: could not read it: %s', describe_error(r.payload))
+                    return
+                diff = r.payload.get('time', 0) - time.time()
+                if abs(diff) <= 5:
+                    if force:
+                        self.status = 'radio clock is already correct'
+                    return
+                r = await self.mc.commands.set_time(int(time.time()))
+        except Exception as e:
+            log.warning('radio clock: %s', e)
+            return
+        if r.type == EventType.ERROR:
+            log.warning('radio clock was %+.0f s off and could not be set: %s', diff, describe_error(r.payload))
+        else:
+            self.status = f'radio clock was {abs(diff):.0f} s {"ahead" if diff > 0 else "behind"}, set to this computer\'s time'
+
+    async def refresh_battery(self):
+        """Read the companion's battery for the title bar (a local request, no airtime)."""
+        try:
+            async with self.radio_lock:
+                r = await self.mc.commands.get_bat()
+            if r.type != EventType.ERROR:
+                self.radio_bat = r.payload.get('level')
+                self.dirty = True
+        except Exception as e:
+            log.warning('battery: %s', e)
+
+    async def radio_info(self):
+        """Window with what the connected companion radio says about itself (no airtime)."""
+        si = self.mc.self_info or {}
+        async with self.radio_lock:
+            dev = await self.mc.commands.send_device_query()
+            bat = await self.mc.commands.get_bat()
+            tm = await self.mc.commands.get_time()
+        dev = dev.payload if dev.type != EventType.ERROR else {}
+        bat = bat.payload if bat.type != EventType.ERROR else {}
+        mv = bat.get('level')
+        self.radio_bat = mv
+        if tm.type != EventType.ERROR:
+            diff = tm.payload.get('time', 0) - time.time()
+            clock = 'in sync' if abs(diff) <= 5 else f'{abs(diff):.0f} s {"ahead of" if diff > 0 else "behind"} this computer'
+        else:
+            clock = '-'
+        nc = len(self.contacts())
+        rows = [
+            ('Name', si.get('name', '-')),
+            ('Public key', si.get('public_key', '-')),
+            ('Firmware', ' '.join(x for x in (dev.get('ver'), f'({dev["fw_build"]})' if dev.get('fw_build') else '') if x) or '-'),
+            ('Board', dev.get('model') or '-'),
+            ('Protocol version', str(dev['fw ver']) if 'fw ver' in dev else '-'),
+            ('Battery', battery_text(mv)),
+        ]
+        if 'used_kb' in bat:
+            rows.append(('Storage', f'{bat["used_kb"]} / {bat["total_kb"]} kB'))
+        rows += [
+            ('Radio', f'{si["radio_freq"]:.3f} MHz, BW {si["radio_bw"]:g} kHz, SF{si["radio_sf"]}, CR 4/{si["radio_cr"]}'
+             if 'radio_freq' in si else '-'),
+            ('TX power', f'{si["tx_power"]} dBm (max {si["max_tx_power"]})' if 'tx_power' in si and 'max_tx_power' in si
+             else f'{si.get("tx_power", "-")} dBm'),
+            ('Location', self.my_position_text()),
+            ('Clock', clock),
+            ('Contacts', f'{nc} of {dev["max_contacts"]}' if 'max_contacts' in dev else str(nc)),
+        ]
+        if 'max_channels' in dev:
+            rows.append(('Channels', f'max {dev["max_channels"]}'))
+        key = si.get('public_key', '')
+        if len(key) == 64:                      # two lines: a phone screen is narrower than 64 characters
+            i = next(n for n, r in enumerate(rows) if r[0] == 'Public key')
+            rows[i:i + 1] = [('Public key', key[:32]), ('', key[32:])]
+        self.show('This radio', [f'{a + ":" if a else "":<18}{b}' for a, b in rows])
+
+    def ask_reboot(self):
+        if self.need_radio():
+            self.confirm_remove = {'label': 'Reboot the radio (the link drops, reconnect afterwards)',
+                                   'run': self.reboot_radio}
+            self.dirty = True
+
+    async def reboot_radio(self):
+        if not self.need_radio():
+            return
+        self.status = 'rebooting the radio...'
+        try:
+            async with self.radio_lock:
+                await asyncio.wait_for(self.mc.commands.reboot(), 3)   # the radio may not answer
+        except (asyncio.TimeoutError, OSError):
+            pass
+        await self.disconnect('radio rebooting: connect again in a few seconds (F3)')
+
+    def set_theme(self, name: str):
+        self.theme = name
+        theme_init_colors(name)
+        self.save_config()
+        self.dirty = True
+
+    def theme_command(self, arg: str):
+        """/theme lists the themes, /theme <name> switches (a unique prefix is enough)."""
+        arg = arg.strip().lower()
+        if not arg:
+            self.show('Colour themes', [f'{"> " if n == self.theme else "  "}{n:<11}{theme_DESCRIPTIONS.get(n, "")}'
+                                        for n in theme_THEMES] + ['', 'Switch with /theme <name>.'])
+            return
+        hits = [n for n in theme_THEMES if n == arg] or [n for n in theme_THEMES if n.startswith(arg)]
+        if len(hits) != 1:
+            self.status = f'no theme "{arg}" (try /theme for the list)' if not hits else \
+                f'"{arg}" is ambiguous: {", ".join(hits)}'
+            return
+        self.set_theme(hits[0])
+
+    async def apply_setting(self, which: str, text: str | None = None):
+        if which == 'info':
+            if self.need_radio():
+                self.settings_open = False
+                await self.radio_info()
+            return
+        if which == 'clock':
+            if self.need_radio():
+                await self.sync_radio_clock(force=True)
+            return
+        if which == 'reboot':
+            self.settings_open = False
+            self.ask_reboot()
+            return
+        if which == 'advert':
+            self.settings_open = False
+            await self.advert()
+            return
+        if which == 'repeaters':
+            self.show_repeaters = not self.show_repeaters
+            return
+        if which == 'retries':
+            self.retries = (self.retries + 1) % (MAX_RETRIES + 1)
+            self.save_config()
+            self.status = f'send retries: {self.retries}'
+            return
+        if which == 'theme':
+            names = list(theme_THEMES)
+            self.set_theme(names[(names.index(self.theme) + 1) % len(names)])
+            return
+        if which == 'autoconnect':
+            self.auto_connect = not self.auto_connect
+            self.save_config()
+            self.status = f'connect on startup: {"on" if self.auto_connect else "off"}'
+            return
+        if not self.need_radio():
+            return
+        si = self.mc.self_info
+        cmds = self.mc.commands
+        if which == 'auto_add':
+            manual = not si.get('manual_add_contacts', False)
+            r = await cmds.set_manual_add_contacts(manual)
+            ok_val = ('manual_add_contacts', manual)
+        elif which == 'name' and text:
+            r = await cmds.set_name(text)
+            ok_val = ('name', text)
+        elif which == 'location' and text is not None:
+            pos = self.parse_position(text)
+            if pos is None:
+                self.status = 'location: enter "lat, lon" in decimal degrees (e.g. 52.37, 4.89), or "none" to clear'
+                return
+            r = await cmds.set_coords(*pos)
+            ok_val = None
+            if r.type != EventType.ERROR:
+                self.mc.self_info.update(adv_lat=pos[0], adv_lon=pos[1])
+        elif which == 'tx_power' and text:
+            try:
+                dbm = int(text)
+            except ValueError:
+                self.status = 'TX power must be a number'
+                return
+            r = await cmds.set_tx_power(dbm)
+            ok_val = ('tx_power', dbm)
+        else:
+            return
+        if r.type == EventType.ERROR:
+            self.status = f'setting failed: {describe_error(r.payload)}'
+        else:
+            if ok_val:
+                self.mc.self_info[ok_val[0]] = ok_val[1]   # library may have replaced the dict
+            self.status = 'saved'
+
+    async def handle_settings_key(self, k):
+        which = self.SETTINGS[self.set_sel]
+        if self.set_edit is not None:
+            if k == '\n':
+                text, self.set_edit = self.set_edit.strip(), None
+                await self.apply_setting(which, text)
+            elif k == '\x1b':
+                self.set_edit = None
+            elif k in ('\x7f', '\b') or k == curses.KEY_BACKSPACE:
+                self.set_edit = self.set_edit[:-1]
+            elif isinstance(k, str) and k.isprintable():
+                self.set_edit += k
+        elif k in ('\x1b', curses.KEY_F2):
+            self.settings_open = False
+        elif k == curses.KEY_UP:
+            self.set_sel = max(0, self.set_sel - 1)
+        elif k == curses.KEY_DOWN:
+            self.set_sel = min(len(self.SETTINGS) - 1, self.set_sel + 1)
+        elif k in (curses.KEY_LEFT, curses.KEY_RIGHT) and which == 'theme':
+            names = list(theme_THEMES)
+            step = 1 if k == curses.KEY_RIGHT else -1
+            self.set_theme(names[(names.index(self.theme) + step) % len(names)])
+        elif k in ('\n', ' '):
+            if which in ('name', 'tx_power', 'location'):
+                if not self.need_radio():
+                    return
+                self.set_edit = ''
+            else:
+                await self.apply_setting(which)
+        elif isinstance(k, str) and len(k) == 1 and ord(k) in (CTRL_Q, CTRL_C):
+            self.quit = True
+        self.dirty = True
+
+    ADVERT_CHOICES = (('Zero hop (direct neighbours only)', False),
+                      ('Flood (forwarded across the mesh)', True))
+
+    async def advert(self, flood: bool | None = None):
+        """Send an advert; with flood=None, ask which kind."""
+        if not self.need_radio():
+            return
+        if flood is None:
+            self.advert_menu_open, self.advert_sel = True, 0
+            self.dirty = True
+            return
+        async with self.radio_lock:
+            r = await self.mc.commands.send_advert(flood=flood)
+        kind = 'flood' if flood else 'zero-hop'
+        self.status = (f'{kind} advert sent' if r.type != EventType.ERROR
+                       else f'advert failed: {describe_error(r.payload)}')
+        self.dirty = True
+
+    async def handle_advert_key(self, k):
+        if k == '\x1b':
+            self.advert_menu_open = False
+        elif k == curses.KEY_UP:
+            self.advert_sel = 0
+        elif k == curses.KEY_DOWN:
+            self.advert_sel = len(self.ADVERT_CHOICES) - 1
+        elif k == '\n':
+            self.advert_menu_open = False
+            await self.advert(self.ADVERT_CHOICES[self.advert_sel][1])
+        elif isinstance(k, str) and len(k) == 1 and ord(k) in (CTRL_Q, CTRL_C):
+            self.quit = True
+        self.dirty = True
+
+    def draw_advert_menu(self, scr, h, w):
+        bw = min(w - 2, 44)
+        bh = len(self.ADVERT_CHOICES) + 3
+        y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+        for y in range(bh):
+            scr.addstr(y0 + y, x0, ' ' * bw, theme_REV)
+        scr.addnstr(y0, x0 + 1, 'Send advert', bw - 2, theme_REV | curses.A_BOLD)
+        for i, (label, _) in enumerate(self.ADVERT_CHOICES):
+            attr = theme_SEL if i == self.advert_sel else theme_REV
+            scr.addnstr(y0 + 1 + i, x0 + 1, label.ljust(bw - 2), bw - 2, attr)
+        scr.addnstr(y0 + bh - 1, x0 + 1, 'Enter send · Esc cancel', bw - 2,
+                    theme_REV | curses.A_DIM)
+        curses.curs_set(0)
+
+    def draw_settings(self, scr, h, w):
+        rows = self.setting_rows()
+        bw = min(w - 2, 58)
+        bh = len(rows) + 4
+        y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+        for y in range(bh):
+            scr.addstr(y0 + y, x0, ' ' * bw, theme_REV)
+        scr.addnstr(y0, x0 + 1, 'Options', bw - 2, theme_REV | curses.A_BOLD)
+        for i, (label, val) in enumerate(rows):
+            if i == self.set_sel and self.set_edit is not None:
+                val = self.set_edit + '_'
+            line = f'{label:<31}{val}'
+            attr = theme_SEL if i == self.set_sel else theme_REV
+            scr.addnstr(y0 + 1 + i, x0 + 1, line.ljust(bw - 2), bw - 2, attr)
+        hint = 'Enter save · Esc cancel' if self.set_edit is not None else \
+            ('←/→ theme · ' if self.SETTINGS[self.set_sel] == 'theme' else '') + 'Enter change · Esc close'
+        scr.addnstr(y0 + bh - 1, x0 + 1, hint, bw - 2, theme_REV | curses.A_DIM)
+        curses.curs_set(0)
+
+
+# ======================================================================
+# contacts
+# ======================================================================
+
+class ContactsMixin:
+    async def trace_command(self, arg: str):
+        """/trace hop,hop,... where a hop is a 1-byte hex hash or a repeater name."""
+        toks = [t for t in arg.replace(',', ' ').split() if t]
+        if not toks:
+            self.status = 'usage: /trace <hop,hop,...>  (hex hash or repeater name)'
+            return
+        if not self.need_radio():
+            return
+        route = []
+        for t in toks:
+            if len(t) == 2 and all(ch in '0123456789abcdefABCDEF' for ch in t):
+                route.append(t.lower())
+                continue
+            hits = [c for c in self.contacts().values()
+                    if c.get('type') in (2, 3) and t.lower() in c.get('adv_name', '').lower()]
+            if len(hits) != 1:
+                self.status = (f'no repeater matches "{t}"' if not hits
+                               else f'"{t}" is ambiguous ({len(hits)} repeaters)')
+                return
+            route.append(hits[0]['public_key'][:2])
+        self.status = 'tracing...'
+        self.dirty = True
+
+        async def go():
+            lines = [f'path: {" > ".join(route)}', ''] + await self.run_trace(route)
+            self.show('Trace', lines)
+            self.status = 'trace done'
+        asyncio.create_task(self.guarded(go()))
+
+    # menu actions that answer with a window; Esc on that window returns to the menu
+    WINDOW_ACTIONS = ('details', 'status', 'telemetry', 'clock', 'owner', 'regions', 'neighbours', 'ping', 'trace', 'discover', 'cmdhelp', 'chdetails', 'people')
+
+    CONTACT_ACTIONS = (
+        ('Details', 'details'), ('Ping (zero hop)', 'ping'), ('Trace path', 'trace'),
+        ('Discover route', 'discover'), ('Set path...', 'setpath'),
+        ('Reset path', 'resetpath'), ('Remove contact', 'remove'),
+    )
+
+    def menu_actions(self) -> tuple:
+        key = self.selected or ('x',)
+        if key[0] == 'c':
+            return self.chan_actions(key)
+        if key[0] in ('l', 'r'):
+            return (('Browse lines' if key[0] == 'l' else 'Browse packets', 'browse'), ('Clear', 'clear'))
+        return self.contact_menu_actions()
+
+    def contact_menu_actions(self) -> tuple:
+        c = self.selected_contact() or {}
+        fav = ('Remove favorite' if c.get('public_key', '')[:12] in self.favorites
+               else 'Add favorite', 'favorite')
+        acts = list(self.CONTACT_ACTIONS)
+        acts.insert(1, fav)
+        if c.get('type') in (2, 3):
+            # every fetch is its own request, so each one is its own entry (airtime)
+            extra = [('Status / battery', 'status'), ('Telemetry', 'telemetry'), ('Clock', 'clock'),
+                     ('Owner info', 'owner')]
+            if c.get('type') == 2:
+                extra += [('Neighbours', 'neighbours'), ('Regions', 'regions')]
+            pk = c.get('public_key', '')[:12]
+            rep = c.get('type') == 2
+            if pk in self.admin:
+                if rep:
+                    extra.append(('Commands...', 'cmdhelp'))
+                extra.append(('Log out', 'logout'))
+            elif not rep:                                     # repeaters log in through the CLI entry
+                extra.append(('Log in (saved password)' if pk in self.passwords else 'Log in...', 'login'))
+            if pk in self.passwords:
+                extra.append(('Forget saved password', 'forgetpw'))
+            acts[2:2] = extra
+        if c.get('type') == 2:
+            cli = 'CLI: type commands' if c.get('public_key', '')[:12] in self.admin else 'CLI: log in and type commands'
+            return ((cli, 'cli'),) + tuple(acts)
+        # only repeaters/rooms answer traces, so no ping for plain clients
+        return (('Chat', 'chat'),) + tuple(a for a in acts if a[1] != 'ping')
+
+    def repeater_cli(self) -> str | None:
+        """For a selected repeater: 'on' when logged in (typed lines are commands), else 'off'; None for anything else."""
+        c = self.selected_contact()
+        if not c or c.get('type') != 2:
+            return None
+        return 'on' if c['public_key'][:12] in self.admin else 'off'
+
+    def selected_contact(self) -> dict | None:
+        key = self.selected
+        if not key or key[0] != 'd':
+            return None
+        return next((v for k, v in self.contacts().items() if k.startswith(key[1])), None)
+
+    def open_contact_menu(self):
+        """Context menu for whatever is selected in the list: channel, contact, Log or Radio."""
+        key = self.selected
+        if key is None:
+            self.status = 'nothing selected'
+        elif key[0] == 'd' and self.selected_contact() is None:
+            self.status = 'not in the contact list'
+        else:
+            self.cmenu_open, self.cmenu_sel = True, 0
+
+    async def item_action(self, action: str):
+        key = self.selected
+        if key is None:
+            return
+        if key[0] == 'd':
+            await self.contact_action(action)
+            return
+        if action == 'chat':
+            self.focus = 'input'
+        elif action == 'browse':
+            self.focus, self.msg_sel = 'msgs', max(0, len(self.history.get(key, [])) - 1)
+        elif action == 'clear':
+            self.history[key] = []
+            self.unread.pop(key, None)
+            self.status = f'cleared {self.name_for(key)}'
+        elif action in ('notify', 'keep', 'people', 'block', 'rename'):
+            await self.channel_action(action, key)
+        elif action == 'chdetails':
+            self.show(f'Channel: {self.name_for(key)}', self.channel_details(key[1]))
+        elif action == 'chremove':
+            if self.need_radio():
+                name = self.name_for(key)
+                self.confirm_remove = {'label': f'Remove channel {name}',
+                                       'run': lambda: self.apply_remove_channel(key[1], name)}
+        self.dirty = True
+
+    def channel_details(self, idx: int) -> list[str]:
+        name = next((n for i, n in self.channels if i == idx), '?')
+        secret = self.chan_secrets.get(idx, '')
+        rows = [('Name', name), ('Slot', str(idx))]
+        if name.startswith('#'):
+            rows.append(('Kind', 'public hashtag channel (key derived from the name)'))
+            rows.append(('Join with', f'/channel {name}'))
+        else:
+            rows.append(('Kind', 'private channel'))
+            rows.append(('Secret', secret or '-'))
+            if secret:
+                rows.append(('Join with', f'/channel {name} {secret}'))
+        out = []
+        for a, b in rows:
+            lines = textwrap.wrap(b, 52, break_long_words=True) or ['']
+            out.append(f'{a + ":":<12}{lines[0]}')
+            out += [' ' * 12 + l for l in lines[1:]]
+        if secret and not name.startswith('#'):
+            out += ['', 'Anyone with this secret can read and post in the channel.']
+        return out
+
+    async def apply_remove_channel(self, idx: int, name: str):
+        if not self.need_radio():
+            return
+        async with self.radio_lock:
+            r = await self.mc.commands.set_channel(idx, '', bytes(16))
+        if r.type == EventType.ERROR:
+            self.status = f'remove failed: {describe_error(r.payload)}'
+            return
+        self.history.pop(('c', idx), None)
+        self.chan_secrets.pop(idx, None)
+        await self.load_channels()
+        self.status = f'removed channel {name}'
+        ents = self.entries()
+        if ents:
+            self.select(ents[0][0])
+
+    def last_signal(self, c: dict) -> tuple | None:
+        """Newest (time, snr, rssi, source) heard from this contact: a message or an advert."""
+        key = c['public_key'][:12]
+        best = self.signal.get(key)
+        for m in reversed(self.history.get(('d', key), [])):
+            if not m.mine and ('SNR' in m.info or 'RSSI' in m.info):
+                if not best or m.recv > best[0]:
+                    best = (m.recv, m.info.get('SNR'), m.info.get('RSSI'), 'message')
+                break
+        return best
+
+    def contact_details(self, c: dict) -> list[str]:
+        fmt = lambda t: datetime.fromtimestamp(t).strftime('%Y-%m-%d %H:%M:%S') if t else 'never'
+        n = c.get('out_path_len', -1)
+        if n in (-1, 255):
+            route = 'flood (no stored path)'
+        elif n == 0:
+            route = 'direct'
+        else:
+            route = f'{n} hop(s): ' + ' > '.join(
+                self.hop_name(h) for h in self.hops_of(c.get('out_path', ''), n))
+        rows = [('Name', c.get('adv_name', '?')),
+                ('Type', NODE_TYPES.get(c.get('type'), '?')),
+                ('Public key', c['public_key']),
+                ('Last advert', fmt(c.get('last_advert', 0))),
+                ('Route', route)]
+        sig = self.last_signal(c)
+        if sig:
+            when, snr, rssi, src = sig
+            parts = ([f'SNR {snr} dB'] if snr is not None else []) + \
+                    ([f'RSSI {rssi} dBm'] if rssi is not None else [])
+            rows.append(('Signal', f'{", ".join(parts)} ({src}, {hhmm(when)})'))
+        stat = self.node_stats.get(c['public_key'][:12])
+        if stat:
+            rows.append(('Battery', f'{battery_text(stat[1].get("bat"))} (status of {hhmm(stat[0])})'))
+        lat, lon = c.get('adv_lat'), c.get('adv_lon')
+        if lat or lon:
+            rows.append(('Position', f'{lat:.5f}, {lon:.5f}'))
+            if dist := self.distance_text(lat, lon):
+                rows.append(('Distance', dist))
+        out = []
+        for a, b in rows:
+            lines = textwrap.wrap(b, 52, break_long_words=True) or ['']
+            out.append(f'{a + ":":<14}{lines[0]}')
+            out += [' ' * 14 + l for l in lines[1:]]
+        return out
+
+    async def run_trace(self, hops: list[str]) -> list[str]:
+        """Send a trace over the given 1-byte hop hashes; returns result lines."""
+        t0 = time.monotonic()
+        async with self.radio_lock:
+            r = await self.mc.commands.send_trace(path=','.join(hops))
+        if r.type == EventType.ERROR:
+            return [f'trace not sent: {describe_error(r.payload)}']
+        tag = int.from_bytes(r.payload['expected_ack'], 'little')
+        timeout = r.payload.get('suggested_timeout', 10000) / 1000 + 5
+        ev = await self.mc.wait_for_event(EventType.TRACE_DATA,
+                                          attribute_filters={'tag': tag}, timeout=timeout)
+        if ev is None:
+            return ['no reply (timed out)',
+                    'Only repeaters and room servers answer traces; the node may be out of range.']
+        rtt = time.monotonic() - t0
+        nodes = ev.payload.get('path', [])
+        out = []
+        for i, nd in enumerate(nodes):
+            who = self.hop_name(nd['hash']) if 'hash' in nd else 'this radio'
+            out.append(f'hop {i + 1}: {who:<30} SNR {nd["snr"]:.2f} dB' if 'snr' in nd
+                       else f'hop {i + 1}: {who}')
+        complete = sum('snr' in nd for nd in nodes) >= len(hops)
+        out.append('' if out else 'empty reply')
+        out.append('REACHABLE' if complete else 'incomplete path')
+        if complete:
+            out.append(f'round trip {rtt * 1000:.0f} ms (including the time to talk to the radio)')
+        return out
+
+    def ping_command(self, arg: str):
+        """/ping [name]: zero-hop trace to the selected (or named) repeater or room server."""
+        arg = arg.strip().lower()
+        if arg:
+            hits = [c for c in self.contacts().values()
+                    if c.get('type') in (2, 3) and arg in c.get('adv_name', '').lower()]
+            if len(hits) != 1:
+                self.status = (f'no repeater matches "{arg}"' if not hits
+                               else f'"{arg}" is ambiguous ({len(hits)} repeaters)')
+                return
+            c = hits[0]
+        else:
+            c = self.selected_contact()
+            if c is None:
+                self.status = 'usage: /ping [repeater name] (or select a repeater first)'
+                return
+            if c.get('type') not in (2, 3):
+                self.status = f'{c.get("adv_name", "?")} is a normal client: only repeaters and room servers answer pings'
+                return
+        if self.need_radio():
+            asyncio.create_task(self.guarded(self.contact_radio_action('ping', c)))
+
+    async def contact_action(self, action: str):
+        c = self.selected_contact()
+        if c is None:
+            return
+        name = c.get('adv_name', '?')
+        if action == 'chat':
+            self.focus = 'input'
+            self.dirty = True
+            return
+        if action == 'details':
+            self.show(f'Contact: {name}', self.contact_details(c))
+            return
+        if action == 'cli':
+            if c['public_key'][:12] in self.admin:
+                self.select(('d', c['public_key'][:12]))
+                self.focus = 'input'
+                self.dirty = True
+                return
+            action = 'login'                                  # logging in lands in the CLI (apply_login)
+        if action == 'login':
+            pw = self.passwords.get(c['public_key'][:12])
+            if pw is None:
+                self.ask_login(c)
+            else:
+                asyncio.create_task(self.guarded(self.apply_login(pw, c, saved=True)))
+            return
+        if action == 'forgetpw':
+            self.forget_password(c)
+            return
+        if action == 'logout':
+            asyncio.create_task(self.guarded(self.apply_logout(c)))
+            return
+        if action == 'cmdhelp':
+            self.show(f'Commands: {name}', list(self.COMMAND_HELP))
+            return
+        if action == 'favorite':
+            k = c['public_key'][:12]
+            self.favorites ^= {k}
+            self.save_config()
+            self.status = f'{name} {"added to" if k in self.favorites else "removed from"} favorites'
+            self.dirty = True
+            return
+        if action == 'remove':
+            self.confirm_remove = {'label': f'Remove {name}', 'run': lambda: self.apply_remove(c)}
+            self.dirty = True
+            return
+        if action == 'setpath':
+            self.ask = {'label': f'New path for {name} (hex hops, e.g. 78,64; empty = direct)',
+                        'text': '', 'cb': self.apply_set_path, 'contact': c}
+            self.dirty = True
+            return
+        if not self.need_radio():
+            return
+        self.menu_task = asyncio.create_task(self.guarded(self.contact_radio_action(action, c)))
+        self.menu_task.add_done_callback(self.menu_task_done)
+
+    def menu_task_done(self, _task):
+        self.menu_task, self.menu_origin = None, None
+
+    async def contact_radio_action(self, action: str, c: dict):
+        name, key = c.get('adv_name', '?'), c['public_key']
+        n = c.get('out_path_len', -1)
+        hops = self.hops_of(c.get('out_path', ''), n) if n not in (-1, 255) else []
+        relay = c.get('type') in (2, 3)
+        if action in ('status', 'telemetry', 'clock', 'owner', 'regions', 'neighbours'):
+            title = {'status': 'Status', 'telemetry': 'Telemetry', 'clock': 'Clock', 'owner': 'Owner info',
+                     'regions': 'Regions', 'neighbours': 'Neighbours'}[action]
+            self.status = f'asking {name} for {title.lower()}...'
+            self.dirty = True
+            lines = await getattr(self, f'repeater_{action}')(c)
+            self.show(f'{title}: {name}', lines)
+            self.status = f'{title.lower()} received' if lines is not self.NO_REPLY else f'no reply from {name}'
+        elif action == 'ping':
+            self.status = f'pinging {name}...'
+            self.dirty = True
+            lines = await self.run_trace([key[:2]])
+            self.show(f'Ping: {name}', lines)
+        elif action == 'trace':
+            if not hops and not relay:
+                self.status = 'no stored path to trace (try Discover route)'
+                return
+            route = hops + ([key[:2]] if relay else []) + hops[::-1]
+            self.status = f'tracing {name}...'
+            self.dirty = True
+            lines = [f'path: {" > ".join(route)}', ''] + await self.run_trace(route)
+            self.show(f'Trace: {name}', lines)
+        elif action == 'discover':
+            self.status = f'discovering route to {name}...'
+            self.dirty = True
+            async with self.radio_lock:
+                ev = await self.mc.commands.send_path_discovery_sync(c, min_timeout=15)
+            if not ev:
+                self.show(f'Route: {name}', ['no response'])
+                return
+            p = ev.payload
+            lines = []
+            for label, k in (('Out', 'out_path'), ('In', 'in_path')):
+                cnt = p.get(f'{k}_len', 0)
+                hs = self.hops_of(p.get(k, ''), cnt)
+                lines.append(f'{label}: {cnt} hop(s)' + (': ' + ' > '.join(self.hop_name(h) for h in hs) if hs else ''))
+            self.show(f'Route: {name}', lines)
+            self.status = 'route discovered'
+        elif action == 'resetpath':
+            async with self.radio_lock:
+                r = await self.mc.commands.reset_path(key)
+            self.status = (f'path reset for {name}' if r.type != EventType.ERROR
+                           else f'reset failed: {describe_error(r.payload)}')
+        self.dirty = True
+
+    async def apply_set_path(self, text: str, c: dict):
+        parts = [p for p in text.replace(' ', '').lower().replace(',', ' ').split() if p]
+        if any(len(p) != 2 or any(ch not in '0123456789abcdef' for ch in p) for p in parts):
+            self.status = 'path must be 1-byte hex hops, e.g. 78,64'
+            return
+        if not self.need_radio():
+            return
+        async with self.radio_lock:
+            r = await self.mc.commands.change_contact_path(c, ''.join(parts))
+        self.status = (f'path set for {c.get("adv_name", "?")}' if r.type != EventType.ERROR
+                       else f'set path failed: {describe_error(r.payload)}')
+
+    async def apply_remove(self, c: dict):
+        if not self.need_radio():
+            return
+        async with self.radio_lock:
+            r = await self.mc.commands.remove_contact(c['public_key'])
+        if r.type == EventType.ERROR:
+            self.status = f'remove failed: {describe_error(r.payload)}'
+            return
+        self.mc.contacts.pop(c['public_key'], None)
+        self.status = f'removed {c.get("adv_name", "?")}'
+        ents = self.contact_entries() or self.entries()
+        if ents:
+            self.select(ents[0][0])
+
+    async def handle_cmenu_key(self, k):
+        n = len(self.menu_actions())
+        if k in ('\x1b', curses.KEY_F7):
+            self.cmenu_open = False
+        elif k == curses.KEY_UP:
+            self.cmenu_sel = max(0, self.cmenu_sel - 1)
+        elif k == curses.KEY_DOWN:
+            self.cmenu_sel = min(n - 1, self.cmenu_sel + 1)
+        elif k == '\n':
+            act = self.menu_actions()[self.cmenu_sel][1]
+            self.cmenu_open = act in ('notify', 'keep')      # settings that cycle keep the menu open
+            self.menu_origin = (self.selected, self.cmenu_sel) if act in self.WINDOW_ACTIONS else None
+            await self.item_action(act)
+            if self.menu_task is None:                       # no window coming: forget the way back
+                self.menu_origin = None
+        elif isinstance(k, str) and len(k) == 1 and ord(k) in (CTRL_Q, CTRL_C):
+            self.quit = True
+        self.dirty = True
+
+    async def handle_ask_key(self, k):
+        a = self.ask
+        if k == '\x1b':
+            self.ask = None
+        elif k == '\n':
+            self.ask = None
+            await a['cb'](a['text'], a['contact'])
+        elif k == '\t' and 'check' in a:
+            a['check'] = not a['check']
+        elif k in ('\x7f', '\b') or k == curses.KEY_BACKSPACE:
+            a['text'] = a['text'][:-1]
+        elif isinstance(k, str) and k.isprintable():
+            a['text'] += k
+        self.dirty = True
+
+    def draw_cmenu(self, scr, h, w):
+        bw = min(w - 2, 40)
+        acts = self.menu_actions()
+        vis = max(1, min(len(acts), h - 5))                  # long menus scroll on small screens
+        off = max(0, min(self.cmenu_sel - vis // 2, len(acts) - vis))
+        bh = vis + 3
+        y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+        for y in range(bh):
+            scr.addstr(y0 + y, x0, ' ' * bw, theme_REV)
+        scr.addnstr(y0, x0 + 1, self.name_for(self.selected), bw - 2, theme_REV | curses.A_BOLD)
+        for i, (label, _) in enumerate(acts[off:off + vis], off):
+            attr = theme_SEL if i == self.cmenu_sel else theme_REV
+            scr.addnstr(y0 + 1 + i - off, x0 + 1, label.ljust(bw - 2), bw - 2, attr)
+        scr.addnstr(y0 + bh - 1, x0 + 1, 'Enter select · Esc close' + (' · ↑/↓ more' if vis < len(acts) else ''),
+                    bw - 2, theme_REV | curses.A_DIM)
+        curses.curs_set(0)
+
+    def draw_ask(self, scr, h, w):
+        a = self.ask
+        bw = min(w - 2, 70)
+        y0, x0 = max(0, h // 2 - 2), max(0, (w - bw) // 2)
+        for y in range(4):
+            scr.addstr(y0 + y, x0, ' ' * bw, theme_REV)
+        scr.addnstr(y0, x0 + 1, a['label'], bw - 2, theme_REV | curses.A_BOLD)
+        shown = '*' * len(a['text']) if a.get('secret') else a['text']
+        scr.addnstr(y0 + 1, x0 + 1, (shown + '_').ljust(bw - 2), bw - 2, theme_REV)
+        if 'check' in a:
+            scr.addnstr(y0 + 2, x0 + 1, f'[{"x" if a["check"] else " "}] {a["check_label"]}  (Tab)', bw - 2, theme_REV)
+        scr.addnstr(y0 + 3, x0 + 1, 'Enter apply · Esc cancel', bw - 2, theme_REV | curses.A_DIM)
+        curses.curs_set(0)
+
+
+# ======================================================================
+# commands
+# ======================================================================
+
+class CommandsMixin:
+    COMMAND_NAMES = ('advert', 'channel', 'clear', 'connect', 'contact', 'disconnect', 'help', 'info', 'log', 'menu', 'quit',
+                     'reload', 'repeaters', 'ping', 'radio', 'reboot', 'search', 'options', 'theme', 'trace')
+
+    def complete(self):
+        """Tab completion for /commands in the input line."""
+        if not self.buf.startswith('/') or ' ' in self.buf or self.buf.startswith('//'):
+            return
+        cyc = getattr(self, '_tab', None)
+        if cyc and self.buf == cyc[2]:                 # repeated Tab: next match
+            hits, i = cyc[0], (cyc[1] + 1) % len(cyc[0])
+        else:
+            word = self.buf[1:].lower()
+            hits, i = [c for c in self.COMMAND_NAMES if c.startswith(word)], -1
+            if not hits:
+                self.status = f'no command matches /{word}'
+                return
+            common = os.path.commonprefix(hits)
+            if len(hits) > 1 and common == word:       # nothing more to add: start cycling
+                i = 0
+            else:
+                self.buf = '/' + common
+        if i >= 0:
+            self.buf = '/' + hits[i]
+        self.pos = len(self.buf)
+        self._tab = (hits, i, self.buf) if len(hits) > 1 else None
+        if len(hits) > 1:
+            self.status = 'matches: ' + '  '.join('/' + c for c in hits)
+
+    async def submit(self, text: str):
+        if not text:
+            return
+        if not text.startswith('/') or text.startswith('//'):
+            await self.send(text[1:] if text.startswith('//') else text)
+            return
+        name, _, arg = text[1:].partition(' ')
+        name = name.lower()
+        if name in ('contact', 'ct', 'menu'):
+            self.open_contact_menu()
+            self.dirty = True
+            return
+        if name in ('p', 'ping'):
+            self.ping_command(arg)
+            self.dirty = True
+            return
+        if name in ('i', 'info'):
+            if self.need_radio():
+                await self.radio_info()
+            self.dirty = True
+            return
+        if name == 'reboot':
+            self.ask_reboot()
+            return
+        if name == 'theme':
+            self.theme_command(arg)
+            self.dirty = True
+            return
+        if name in ('a', 'advert'):
+            kinds = {'': None, 'zero': False, 'zerohop': False, '0': False, 'flood': True}
+            if arg.strip().lower() not in kinds:
+                self.status = 'usage: /advert [zero|flood]'
+            else:
+                await self.advert(kinds[arg.strip().lower()])
+            self.dirty = True
+            return
+        if name in ('f', 'find', 'search'):
+            self.do_search(arg.strip())
+            self.dirty = True
+            return
+        if name in ('t', 'trace'):
+            await self.trace_command(arg)
+            self.dirty = True
+            return
+        if name in ('ch', 'channel'):
+            await self.create_channel(arg.strip())
+            self.dirty = True
+            return
+        cmds = {
+            ('q', 'quit', 'exit'): lambda: setattr(self, 'quit', True),
+            ('c', 'connect'): self.pick_device,
+            ('d', 'disconnect'): self.disconnect,
+            ('r', 'reload'): self.reload,
+            ('o', 'options', 's', 'settings'): lambda: setattr(self, 'settings_open', True),
+            ('clear', 'cls'): self.clear_current,
+            ('l', 'log', 'console'): lambda: self.select(LOG_KEY),
+            ('radio', 'rx', 'rxlog'): lambda: self.select(RX_KEY),
+            ('repeaters',): lambda: setattr(self, 'show_repeaters', not self.show_repeaters),
+            ('h', 'help', '?'): self.help,
+        }
+        for names, fn in cmds.items():
+            if name in names:
+                r = fn()
+                if asyncio.iscoroutine(r):
+                    await r
+                self.dirty = True
+                return
+        self.status = f'unknown command /{name} (try /help)'
+
+    def clear_current(self):
+        """Empty the selected conversation (Log and Radio included)."""
+        key = self.selected
+        if key is None:
+            return
+        self.history[key] = []
+        self.unread.pop(key, None)
+        self.msg_sel = self.scroll = 0
+        if key != LOG_KEY:
+            self.status = f'cleared {self.name_for(key)}'
+
+    HELP = (
+        ('Keys', ''),
+        ('Up / Down', 'move through the list on the left'),
+        ('PgUp / PgDn', 'scroll history'),
+        ('Enter', 'in the list: context menu; in the input: send'),
+        ('Tab', 'list > input > messages > list (messages: Up/Down, Enter = details, r = resend)'),
+        ('Esc', 'back one step: messages > input > list'),
+        ('F1', 'this help'),
+        ('F2', 'options (name, TX power, advert, theme, ...)'),
+        ('F3', 'choose device and connect / disconnect'),
+        ('F7', 'context menu of the selected item (same as Enter in the list)'),
+        ('F9', 'Radio: every packet heard (Tab: select, Enter = details)'),
+        ('F8', 'Log: status messages (lights up on problems)'),
+        ('F10', 'quit (asks to confirm)'),
+        ('^Q, ^C', 'quit immediately'),
+        ('^A ^E', 'start / end of line'),
+        ('^B ^F', 'cursor left / right'),
+        ('^U ^K ^W', 'kill to start / end / previous word'),
+        ('^Y ^D', 'yank / delete char'),
+        ('^L', 'repaint the screen'),
+        ('^P ^N', 'previous / next conversation'),
+        ('', ''),
+        ('Commands', ''),
+        ('Tab (after /)', 'complete a /command'),
+        ('/help  /h  /?', 'this help'),
+        ('/quit  /q', 'quit immediately'),
+        ('/channel <name> [key]', 'create / join a channel (#name = public)'),
+        ('/contact  /menu', 'context menu of the selected item (F7)'),
+        ('/connect  /c', 'reconnect to the local radio'),
+        ('/disconnect  /d', 'disconnect from the radio'),
+        ('/advert  /a', 'advert menu, or /advert zero|flood'),
+        ('/clear', 'empty the selected conversation (Log, Radio, channel or chat)'),
+        ('/log  /console', 'show the Log (F8)'),
+        ('/radio  /rxlog', 'show the Radio packet list (F9)'),
+        ('/search  /f', 'search all messages: /search <text>'),
+        ('/trace  /t', 'trace hops: /trace 78,64,78 or repeater names'),
+        ('/reload  /r', 'reload contacts and channels'),
+        ('/options  /o  /settings', 'options (F2)'),
+        ('/ping [name]', 'ping the selected or named repeater / room server'),
+        ('/info  /i', 'this radio: public key, firmware, battery, ...'),
+        ('/reboot', 'reboot the radio (asks first)'),
+        ('/theme [name]', 'list colour themes / switch to one'),
+        ('/repeaters', 'show / hide repeaters'),
+        ('//text', 'send a message starting with /'),
+    )
+
+    def help(self):
+        self.help_open, self.help_scroll = True, 0
+
+    def draw_help(self, scr, h, w):
+        bw = min(w - 2, 72)
+        room = max(3, h - 4)
+        self.help_scroll = min(self.help_scroll, max(0, len(self.HELP) - room))
+        rows = self.HELP[self.help_scroll:self.help_scroll + room]
+        bh = len(rows) + 3
+        y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+        for y in range(bh):
+            scr.addstr(y0 + y, x0, ' ' * bw, theme_REV)
+        scr.addnstr(y0, x0 + 1, f'Help — {APP} {__version__}', bw - 2, theme_REV | curses.A_BOLD)
+        for i, (a, b) in enumerate(rows):
+            if a and not b:
+                scr.addnstr(y0 + 1 + i, x0 + 1, a, bw - 2, theme_REV | curses.A_UNDERLINE)
+            else:
+                scr.addnstr(y0 + 1 + i, x0 + 1, f'{a:<24}{b}', bw - 2, theme_REV)
+        scr.addnstr(y0 + bh - 1, x0 + 1, 'Up/Down scroll · any other key closes' if len(self.HELP) > room
+                    else 'press any key to close', bw - 2, theme_REV | curses.A_DIM)
+        curses.curs_set(0)
+
+
+# ======================================================================
+# ui
+# ======================================================================
+
+class UiMixin:
+    async def handle_key(self, k):
+        if k == '\x0c':                       # Ctrl-L: full repaint
+            self.repaint = True
+            self.dirty = True
+            return
+        if self.details is not None:
+            self.dirty = True
+            page = max(1, self.scr_h - 5)
+            if k in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE,
+                     curses.KEY_HOME, curses.KEY_END):
+                self.details_scroll = {curses.KEY_UP: self.details_scroll - 1,
+                                       curses.KEY_DOWN: self.details_scroll + 1,
+                                       curses.KEY_PPAGE: self.details_scroll - page,
+                                       curses.KEY_NPAGE: self.details_scroll + page,
+                                       curses.KEY_HOME: 0, curses.KEY_END: 10 ** 6}[k]
+                return
+            self.details = None
+            back, self.details_back = self.details_back, None
+            if back and self.selected == back[0]:        # one step back: the menu the window came from
+                self.cmenu_open, self.cmenu_sel = True, back[1]
+            return
+        if self.help_open:
+            if k == curses.KEY_UP:
+                self.help_scroll = max(0, self.help_scroll - 1)
+            elif k == curses.KEY_DOWN:
+                self.help_scroll += 1
+            elif k == curses.KEY_PPAGE:
+                self.help_scroll = max(0, self.help_scroll - 10)
+            elif k == curses.KEY_NPAGE:
+                self.help_scroll += 10
+            else:
+                self.help_open = False
+            self.dirty = True
+            return
+        if self.confirm_quit:
+            if k in ('y', 'Y', '\n'):
+                self.quit = True
+            elif k in ('n', 'N', '\x1b', curses.KEY_F10):
+                self.confirm_quit = False
+            self.dirty = True
+            return
+        if self.ask:
+            await self.handle_ask_key(k)
+            return
+        if self.confirm_remove:
+            if k in ('y', 'Y'):
+                run, self.confirm_remove = self.confirm_remove['run'], None
+                await run()
+            elif k in ('n', 'N', '\x1b', '\n'):
+                self.confirm_remove = None
+            self.dirty = True
+            return
+        if self.search:
+            self.handle_search_key(k)
+            return
+        if self.cmenu_open:
+            await self.handle_cmenu_key(k)
+            return
+        if self.advert_menu_open:
+            await self.handle_advert_key(k)
+            return
+        if k == curses.KEY_F10:
+            self.confirm_quit = True
+            self.dirty = True
+            return
+        if k == curses.KEY_F7 and not self.settings_open:
+            self.open_contact_menu()
+            self.dirty = True
+            return
+        if k == curses.KEY_F1:
+            self.help_open, self.help_scroll = True, 0
+            self.dirty = True
+            return
+        if k in (curses.KEY_F8, curses.KEY_F9):
+            self.select(LOG_KEY if k == curses.KEY_F8 else RX_KEY)
+            return
+        if k == curses.KEY_F2 and not self.settings_open:
+            self.settings_open = True
+            self.dirty = True
+            return
+        if self.settings_open:
+            await self.handle_settings_key(k)
+            return
+        if self.focus == 'side' and self.handle_side_key(k):
+            return
+        if self.focus == 'msgs' and self.handle_msg_focus_key(k):
+            return
+        if isinstance(k, str):
+            o = ord(k) if len(k) == 1 else -1
+            if k == '\n':
+                text, self.buf, self.pos = self.buf.strip(), '', 0
+                await self.submit(text)
+            elif o in (CTRL_Q, CTRL_C):
+                self.quit = True
+            elif k == '\t':
+                if self.buf.startswith('/') and ' ' not in self.buf:
+                    self.complete()
+                elif self.history.get(self.selected):
+                    self.focus = 'msgs'
+                    self.msg_sel = len(self.history[self.selected]) - 1
+                else:
+                    self.focus = 'side'
+            elif k == '\x1b':
+                self.focus = 'side'
+            elif k in ('\x7f', '\b'):
+                if self.pos:
+                    self.buf = self.buf[:self.pos - 1] + self.buf[self.pos:]
+                    self.pos -= 1
+            elif o == 1:                       # ^A  home
+                self.pos = 0
+            elif o == 5:                       # ^E  end
+                self.pos = len(self.buf)
+            elif o == 2:                       # ^B  back
+                self.pos = max(0, self.pos - 1)
+            elif o == 6:                       # ^F  forward
+                self.pos = min(len(self.buf), self.pos + 1)
+            elif o == 4:                       # ^D  delete char
+                self.buf = self.buf[:self.pos] + self.buf[self.pos + 1:]
+            elif o == 21:                      # ^U  kill to start of line
+                self.kill, self.buf, self.pos = self.buf[:self.pos], self.buf[self.pos:], 0
+            elif o == 11:                      # ^K  kill to end of line
+                self.kill, self.buf = self.buf[self.pos:], self.buf[:self.pos]
+            elif o == 23:                      # ^W  kill previous word
+                start = len(self.buf[:self.pos].rstrip())
+                start = self.buf.rfind(' ', 0, start) + 1
+                self.kill, self.buf, self.pos = (self.buf[start:self.pos],
+                                                 self.buf[:start] + self.buf[self.pos:], start)
+            elif o == 25:                      # ^Y  yank
+                self.buf = self.buf[:self.pos] + self.kill + self.buf[self.pos:]
+                self.pos += len(self.kill)
+            elif o == 16:                      # ^P  previous conversation
+                self.move(-1)
+            elif o == 14:                      # ^N  next conversation
+                self.move(1)
+            elif k.isprintable():
+                self.buf = self.buf[:self.pos] + k + self.buf[self.pos:]
+                self.pos += 1
+        elif k == curses.KEY_UP:
+            self.move(-1)
+        elif k == curses.KEY_DOWN:
+            self.move(1)
+        elif k == curses.KEY_PPAGE:
+            self.scroll += 5
+        elif k == curses.KEY_NPAGE:
+            self.scroll = max(0, self.scroll - 5)
+        elif k == curses.KEY_LEFT:
+            self.pos = max(0, self.pos - 1)
+        elif k == curses.KEY_RIGHT:
+            self.pos = min(len(self.buf), self.pos + 1)
+        elif k == curses.KEY_HOME:
+            self.pos = 0
+        elif k == curses.KEY_END:
+            self.pos = len(self.buf)
+        elif k == curses.KEY_BACKSPACE:
+            if self.pos:
+                self.buf = self.buf[:self.pos - 1] + self.buf[self.pos:]
+                self.pos -= 1
+        elif k == curses.KEY_DC:
+            self.buf = self.buf[:self.pos] + self.buf[self.pos + 1:]
+        elif k == curses.KEY_F3:
+            await self.toggle_connection()
+        self.dirty = True
+
+    def handle_side_key(self, k) -> bool:
+        """Keys while the list on the left has focus; returns False to fall through to the input."""
+        if k in (curses.KEY_UP, '\x10'):
+            self.move(-1)
+        elif k in (curses.KEY_DOWN, '\x0e'):
+            self.move(1)
+        elif k == curses.KEY_PPAGE:
+            self.scroll += 5
+        elif k == curses.KEY_NPAGE:
+            self.scroll = max(0, self.scroll - 5)
+        elif k == '\n':
+            self.open_contact_menu()
+        elif k == '\t':
+            self.focus = 'input'
+        elif k == '\x1b':
+            pass
+        elif isinstance(k, str) and not (len(k) == 1 and ord(k) in (CTRL_Q, CTRL_C)):
+            self.focus = 'input'              # typing from the list starts a message
+            return False
+        else:
+            return False
+        self.dirty = True
+        return True
+
+    def draw(self, scr):
+        h, w = scr.getmaxyx()
+        self.scr_h = h
+        if self.repaint:
+            scr.clear()
+            self.repaint = False
+        scr.erase()
+        if h < 6 or w < SIDEBAR_W + 20:
+            scr.addstr(0, 0, 'terminal too small'[:w - 1])
+            scr.refresh()
+            return
+        sw = SIDEBAR_W
+        mw = w - sw - 1
+        body_h = h - 3                      # title row at 0, input + status at bottom
+
+        # sidebar
+        ents = self.entries()
+        rows: list[tuple[str, tuple | None]] = []
+        n_ch = len(self.channels)
+        rows.append(('Channels', None))
+        for k, n in ents[:n_ch]:
+            rows.append((n, k))
+        people = [(k, n) for k, n in ents[n_ch:-2] if not self.is_infra(k)]
+        infra = [(k, n) for k, n in ents[n_ch:-2] if self.is_infra(k)]
+        rows.append(('Contacts', None))
+        rows += [(n, k) for k, n in people]
+        if infra:
+            rows.append(('Repeaters', None))
+            rows += [(n, k) for k, n in infra]
+        rows.append(('Console', None))
+        for k, n in ents[-2:]:
+            rows.append((n, k))
+        sel_row = next((i for i, (_, k) in enumerate(rows) if k == self.selected), 0)
+        top = max(0, min(sel_row - body_h // 2, len(rows) - body_h))
+        for y, (label, key) in enumerate(rows[top:top + body_h]):
+            if key is None:
+                scr.addnstr(1 + y, 0, label, sw - 1, theme_HEAD)
+                continue
+            u = self.unread.get(key, 0)
+            tail = f' {u}' if u else ''
+            text = ' ' + label[:sw - 3 - len(tail)]
+            text = text.ljust(sw - 1 - len(tail)) + tail
+            attr = theme_SEL if key == self.selected else (
+                theme_UNREAD if u else curses.A_NORMAL)
+            scr.addnstr(1 + y, 0, text, sw - 1, attr)
+        for y in range(1, h - 2):
+            scr.addstr(y, sw, '│')
+
+        # title
+        si = (self.mc.self_info if self.mc else None) or {}
+        title = f' {APP} {__version__} — {si["name"]} ' if si.get('name') else f' {APP} {__version__} '
+        if self.mc and self.radio_bat:
+            title += f'· bat {max(0, min(100, round((self.radio_bat - 3000) / 12)))}% '
+        if self.selected:
+            title += f'— {self.name_for(self.selected)} '
+            if self.repeater_cli() == 'on':
+                title += '(CLI) '
+        scr.addnstr(0, 0, ' ' * w, w - 1, theme_REV)
+        scr.addnstr(0, 0, title, w - 1, theme_REV)
+        conn = self.connection_text()          # the title bar only ever shows the connection state
+        room = w - 1 - len(title) - 2
+        if room > 8:
+            conn = conn if len(conn) <= room else conn[:room - 1] + '…'
+            scr.addnstr(0, w - 1 - len(conn) - 1, conn, room, theme_REV)
+
+        # messages
+        lines = self.render_lines(mw)
+        self.last_body_h = body_h
+        if self.focus == 'msgs':
+            self.msg_sel = max(0, min(self.msg_sel, len(self.history.get(self.selected, [])) - 1))
+            idx = [i for i, l in enumerate(lines) if l[2] == self.msg_sel]
+            if idx:                          # scroll so the highlighted message is visible
+                end_now = len(lines) - self.scroll
+                if idx[-1] >= end_now:
+                    self.scroll = len(lines) - idx[-1] - 1
+                elif idx[0] < end_now - body_h:
+                    self.scroll = max(0, len(lines) - idx[0] - body_h)
+        self.scroll = min(self.scroll, max(0, len(lines) - body_h))
+        end = len(lines) - self.scroll
+        for y, (text, attr, n) in enumerate(lines[max(0, end - body_h):end]):
+            if self.focus == 'msgs' and n == self.msg_sel:
+                attr = theme_SEL
+            scr.addnstr(1 + y, sw + 1, text, mw, attr)
+        if self.scroll:
+            scr.addnstr(body_h, sw + 1, f'-- {self.scroll} lines up (PgDn) --', mw, curses.A_DIM)
+
+        # input + status
+        cli = self.repeater_cli()
+        prompt = f'{self.name_for(self.selected)[:14]}# ' if cli == 'on' else '> '
+        vis = w - len(prompt) - 1
+        start = max(0, self.pos - vis + 1)
+        if self.focus == 'side' and not self.buf:
+            scr.addnstr(h - 2, 0, 'Enter: menu · Tab: write a message · type to start one', w - 1, curses.A_DIM)
+        else:
+            scr.addnstr(h - 2, 0, prompt + self.buf[start:start + vis], w - 1)
+            if not self.buf and cli:
+                hint = ('commands go to the repeater: ver, clock, advert, ...' if cli == 'on'
+                        else 'not logged in: Esc, Enter, then "CLI" to manage this repeater')
+                scr.addnstr(h - 2, len(prompt), hint, max(0, w - 1 - len(prompt)), curses.A_DIM)
+        keys = [('F1', 'Help'), ('F2', 'Options'),
+                ('F3', 'Disconnect' if self.mc else 'Connect'),
+                ('F7', 'Menu'), ('F8', 'Log'), ('F9', 'RX log'), ('F10', 'Quit')]
+        status = ' ' + '  '.join(f'{k} {v}' for k, v in keys)
+        scr.addnstr(h - 1, 0, status.ljust(w), w - 1, theme_REV)
+        scr.move(h - 2, min(w - 1, len(prompt) + self.pos - start))
+        curses.curs_set(1 if self.focus == 'input' else 0)
+        if self.settings_open:
+            self.draw_settings(scr, h, w)
+        if self.help_open:
+            self.draw_help(scr, h, w)
+        if self.details is not None:
+            self.draw_details(scr, h, w)
+        if self.search:
+            self.draw_search(scr, h, w)
+        if self.cmenu_open:
+            self.draw_cmenu(scr, h, w)
+        if self.advert_menu_open:
+            self.draw_advert_menu(scr, h, w)
+        if self.ask:
+            self.draw_ask(scr, h, w)
+        if self.confirm_remove:
+            msg = f' {self.confirm_remove["label"]}?  [y] yes  [n/Esc] no '
+            y0, x0 = h // 2, max(0, (w - len(msg)) // 2)
+            scr.addnstr(y0, x0, msg, w - 1 - x0, theme_REV | curses.A_BOLD)
+            curses.curs_set(0)
+        if self.confirm_quit:
+            msg = f' Quit {APP}?  [y/Enter] yes  [n/Esc] no '
+            y0, x0 = h // 2, max(0, (w - len(msg)) // 2)
+            scr.addnstr(y0, x0, msg, w - 1 - x0, theme_REV | curses.A_BOLD)
+            curses.curs_set(0)
+        scr.refresh()
+
+
+# ======================================================================
+# app
+# ======================================================================
+
+class App(ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMixin, ChannelsMixin, RepeaterMixin, CommandsMixin, UiMixin):
+    @property
+    def status(self) -> str:
+        return self._status
+
+    @property
+    def show_repeaters(self) -> bool:
+        return self._show_repeaters
+
+    @show_repeaters.setter
+    def show_repeaters(self, value: bool):
+        self._show_repeaters = value
+        self.save_config()
+
+    def save_config(self):
+        cfg = {'show_repeaters': self._show_repeaters, 'auto_connect': self.auto_connect,
+               'theme': self.theme, 'favorites': sorted(self.favorites), 'channels': self.chan_prefs, 'retries': self.retries}
+        try:
+            os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump(cfg, f, indent=2)
+        except OSError as e:
+            log.warning('could not save config: %s', e)
+
+    @staticmethod
+    def load_history() -> dict:
+        try:
+            with open(HISTORY_FILE) as f:
+                raw = json.load(f)
+            return {(k[0], k[1]): [Msg(**m) for m in ms] for k, ms in
+                    ((json.loads(k), v) for k, v in raw.items())}
+        except (OSError, ValueError, TypeError, IndexError):
+            return {}
+
+    def save_history(self):
+        raw = {json.dumps(k): [asdict(m) for m in ms[-self.keep_for(k):] if m.who != '*']
+               for k, ms in self.history.items() if k and k not in (RX_KEY, LOG_KEY)}
+        raw = {k: v for k, v in raw.items() if v}
+        data = json.dumps(raw, default=lambda o: o.hex() if isinstance(o, (bytes, bytearray)) else str(o))
+        if data == self._saved_history:
+            return
+        try:
+            os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
+            with open(HISTORY_FILE + '.tmp', 'w') as f:
+                f.write(data)
+            os.replace(HISTORY_FILE + '.tmp', HISTORY_FILE)
+            self._saved_history = data
+        except OSError as e:
+            log.warning('could not save history: %s', e)
+
+    @status.setter
+    def status(self, text: str):
+        self._status = text
+        log.info(text)
+
+    def __init__(self, args):
+        self.args = args
+        self.mc: MeshCore | None = None
+        self.connecting = False
+        self.contact_cache: dict = {}        # last known contacts, kept after disconnect
+        self.channels: list[tuple[int, str]] = []
+        self.history: dict[tuple, list[Msg]] = self.load_history()
+        self._saved_history = ''
+        self.unread: dict[tuple, int] = {}
+        self.selected: tuple | None = None
+        cfg = load_config()
+        self._show_repeaters = bool(cfg.get('show_repeaters', False))
+        self.auto_connect = bool(cfg.get('auto_connect', True))
+        self.favorites: set[str] = set(cfg.get('favorites', []))     # contact key prefixes (12 hex)
+        self.chan_prefs: dict[str, dict] = cfg.get('channels') if isinstance(cfg.get('channels'), dict) else {}
+        self.retries = max(0, min(MAX_RETRIES, int(cfg.get('retries', 1))))
+        self.theme = cfg.get('theme') if cfg.get('theme') in theme_THEMES else 'blue'
+        self.scroll = 0                      # lines scrolled up from bottom
+        self.buf = ''
+        self.pos = 0
+        self.status = 'disconnected'
+        self.pending_acks: dict[str, Msg] = {}
+        self.dirty = True
+        self.repaint = False
+        self.quit = False
+        self.settings_open = False
+        self.set_sel = 0
+        self.focus = 'side'                  # 'side' (list) | 'input' | 'msgs'
+        self.chan_secrets: dict[int, str] = {}   # slot -> secret hex, from the last channel load
+        self.search: dict | None = None      # /search results overlay
+        self.msg_sel = 0
+        self.last_body_h = 0
+        self.details: list[str] | None = None
+        self.details_title = 'Message details'
+        self.details_scroll = 0
+        self.scr_h = 24
+        self.details_back: tuple | None = None   # (key, menu row) of the context menu to return to
+        self.menu_origin: tuple | None = None    # set when a menu action may open a window
+        self.menu_task: asyncio.Task | None = None
+        self.cmenu_open = False
+        self.cmenu_sel = 0
+        self.advert_menu_open = False
+        self.advert_sel = 0
+        self.ask: dict | None = None         # single-line input prompt: label/text/cb
+        self.confirm_remove: dict | None = None
+        self.help_open = False
+        self.help_scroll = 0
+        self.passwords: dict[str, str] = self.load_passwords()   # repeater key prefix -> remembered password
+        self.admin: set[str] = set()         # repeaters / rooms we are logged in to (key prefixes)
+        self.radio_bat: int | None = None        # companion battery in mV, for the title bar
+        self.node_stats: dict[str, tuple] = {}   # key prefix -> (time, status dict) from the last status request
+        self.signal: dict[str, tuple] = {}   # key prefix -> (time, snr, rssi, source) from adverts
+        self.radio_lock = asyncio.Lock()     # the library can't tell concurrent replies apart
+        self.kill = ''                       # readline kill ring (one slot)
+        self.confirm_quit = False
+        self.set_edit: str | None = None     # text being edited, None when not editing
+        LOG.sink = self.on_log_record        # status messages and library logs go to the Log entry
+        for rec in list(LOG.records):
+            self.on_log_record(rec)
+        LOG.records.clear()
+
+    def contact_entries(self) -> list[tuple[tuple, str]]:
+        """People first, then repeaters and room servers; each newest first (favourites on top)."""
+        out, infra = [], []
+        known = set()
+        contacts = sorted(self.contacts().values(),
+                          key=lambda c: (c['public_key'][:12] not in self.favorites,
+                                         -c.get('last_advert', 0)))
+        for c in contacts:
+            key = ('d', c['public_key'][:12])
+            known.add(key)
+            is_rep = c.get('type') == 2
+            infra_node = c.get('type') in (2, 3)
+            fav = key[1] in self.favorites
+            if is_rep and not self.show_repeaters and not fav and key not in self.history:
+                continue
+            tag = '★' if fav else ''
+            (infra if infra_node else out).append((key, tag + (c.get('adv_name') or c['public_key'][:8])))
+        for key in self.history:
+            if key and key[0] == 'd' and key not in known:
+                out.append((key, key[1][:8]))
+        return out + infra
+
+    def is_infra(self, key: tuple) -> bool:
+        """Repeater or room server (listed under Repeaters)."""
+        return key[0] == 'd' and any(c.get('type') in (2, 3) for k, c in self.contacts().items()
+                                     if k.startswith(key[1]))
+
+    def entries(self) -> list[tuple[tuple, str]]:
+        ch = [(('c', i), n) for i, n in self.channels]
+        return ch + self.contact_entries() + [(LOG_KEY, 'Log'), (RX_KEY, 'Radio')]
+
+    def name_for(self, key: tuple) -> str:
+        for k, n in self.entries():
+            if k == key:
+                return n
+        return key[1][:8] if key[0] == 'd' else f'ch{key[1]}'
+
+    def add(self, key: tuple, msg: Msg, unread: bool = True):
+        msgs = self.history.setdefault(key, [])
+        msgs.append(msg)
+        if key[0] == 'c' and len(msgs) > self.keep_for(key):
+            del msgs[0]
+        if key in (RX_KEY, LOG_KEY) and len(msgs) > LOG_LINES:
+            del msgs[0]
+            self.msg_sel = max(0, self.msg_sel - 1)
+        if key == self.selected:
+            self.scroll = 0
+            if self.focus == 'msgs' and self.msg_sel == len(msgs) - 2:
+                self.msg_sel = len(msgs) - 1
+        elif unread and self.counts_unread(key, msg):
+            self.unread[key] = self.unread.get(key, 0) + 1
+        self.dirty = True
+
+    def on_log_record(self, record):
+        """Log lines become messages in the Log conversation; problems make its sidebar entry light up."""
+        text = record.getMessage()
+        if record.name != APP:
+            text = f'{record.name.split(".")[-1]}: {text}'
+        if record.levelno >= logging.WARNING:
+            text = f'{record.levelname}: {text}'
+        problem = record.levelno >= logging.WARNING or (record.name == APP and theme_is_problem(text))
+        now = int(record.created)
+        for line in text.splitlines() or ['']:
+            self.add(LOG_KEY, Msg(now, '', line, recv=now), unread=problem)
+
+    def connection_text(self) -> str:
+        if self.connecting:
+            return f'connecting to {self.target()}...'
+        return f'connected to {self.target()}' if self.mc else 'disconnected'
+
+    def select(self, key: tuple):
+        self.selected = key
+        if self.focus == 'msgs':
+            self.focus = 'input'
+        self.unread.pop(key, None)
+        self.scroll = 0
+        self.dirty = True
+
+    def move(self, delta: int):
+        ents = self.entries()
+        if not ents:
+            return
+        keys = [k for k, _ in ents]
+        i = keys.index(self.selected) if self.selected in keys else -1
+        self.select(keys[max(0, min(len(keys) - 1, i + delta))])
+
+    def contacts(self) -> dict:
+        return self.mc.contacts if self.mc else self.contact_cache
+
+    def target(self) -> str:
+        return 'local radio'
+
+    def need_radio(self) -> bool:
+        if self.mc is None:
+            self.status = 'not connected'
+            self.dirty = True
+            return False
+        return True
+
+    def note(self, text: str):
+        """Local-only line in the current conversation (never sent)."""
+        self.history.setdefault(self.selected, []).append(
+            Msg(0, '*', text, mine=True))
+        self.scroll = 0
+        self.dirty = True
+
+    def hop_name(self, h: str) -> str:
+        """Name for a path hash (repeaters preferred, since those are what relay)."""
+        hits = [c for c in self.contacts().values() if c['public_key'].startswith(h.lower())]
+        hits.sort(key=lambda c: c.get('type') != 2)
+        return f'{hits[0]["adv_name"]} ({h})' if hits else h
+
+    @staticmethod
+    def hops_of(path_hex: str, n: int) -> list[str]:
+        return [path_hex[i:i + 2] for i in range(0, n * 2, 2)]
+
+    def show(self, title: str, lines: list[str]):
+        if self.details is None or title != self.details_title:
+            self.details_scroll = 0
+        if self.menu_origin:                     # opened from a context menu: Esc returns there
+            self.details_back, self.menu_origin = self.menu_origin, None
+        elif self.details is None:
+            self.details_back = None
+        self.details_title, self.details = title, lines
+        self.dirty = True
+
+    async def guarded(self, coro):
+        try:
+            await coro
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.exception('action failed')
+            self.status = f'failed: {e}'
+            self.dirty = True
+
+
+# ======================================================================
+# cli
+# ======================================================================
+
+async def ui(scr, app: App):
+    curses.curs_set(1)
+    theme_init_colors(app.theme)
+    scr.nodelay(True)
+    scr.keypad(True)
+    while not app.quit:
+        try:
+            k = scr.get_wch()
+        except curses.error:
+            k = None
+        if k is None:
+            if app.dirty:
+                app.dirty = False
+                app.draw(scr)
+            await asyncio.sleep(0.03)
+            continue
+        if k == curses.KEY_RESIZE:
+            app.dirty = True
+            continue
+        await app.handle_key(k)
+
+async def run(scr, args):
+    app = App(args)
+    if app.auto_connect:
+        app.start_auto_connect()
+    async def autosave():
+        while True:
+            await asyncio.sleep(10)
+            app.save_history()
+    saver = asyncio.create_task(autosave())
+    try:
+        await ui(scr, app)
+    finally:
+        saver.cancel()
+        app.save_history()
+        await app.disconnect()
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog=APP, description='ncurses MeshCore chat for the M5 CardputerZero with the Cap-LoRa-1262',
+        epilog=f'First run: {APP} install   (sets up meshcore-pi, a venv and {PI_CONFIG})')
+    ap.add_argument('--version', action='version', version=f'{APP} {__version__}')
+    ap.parse_args()
+    args = argparse.Namespace()
+    locale.setlocale(locale.LC_ALL, '')
+    os.environ.setdefault('ESCDELAY', '25')   # ncurses waits 1000ms after Esc by default
+    # keep library log output off the screen; F8 shows it
+    root = logging.getLogger()
+    root.handlers[:] = [LOG]
+    root.setLevel(logging.INFO)
+
+    def wrapped(scr):
+        asyncio.run(run(scr, args))
+
+    try:
+        curses.wrapper(lambda scr: (curses.raw(), wrapped(scr)))
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        raise SystemExit(f'{APP}: {type(e).__name__}: {e}')
+
+
+if __name__ == '__main__':
+    main()
