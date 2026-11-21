@@ -35,6 +35,7 @@ import ctypes
 import signal
 import socket
 import re
+import shutil
 import subprocess
 import sys
 
@@ -336,16 +337,90 @@ def install(argv):
     return 0
 
 
+CONFIG_DIR = os.path.expanduser('~/.config/cardputer-mesh')      # chat history and UI settings
+IDENTITY_FILES = ('config.toml', 'contacts.mesh', 'channels.json')
+
+
+def _running_pids():
+    """pids of a running cardputer-mesh or of the meshcore-pi it started (other than this process)."""
+    me, found = os.getpid(), []
+    script = os.path.realpath(__file__)
+    for entry in os.listdir('/proc'):
+        if not entry.isdigit() or int(entry) == me:
+            continue
+        try:
+            with open(f'/proc/{entry}/cmdline', 'rb') as f:
+                args = f.read().decode(errors='replace').split('\0')
+        except OSError:
+            continue
+        if any(a.startswith(PI_DIR + os.sep) and a.endswith('meshcore.py') for a in args) or \
+                (script in [os.path.realpath(a) for a in args[1:3] if a] and 'uninstall' not in args):
+            found.append(int(entry))
+    return found
+
+
+def uninstall(argv):
+    ap = argparse.ArgumentParser(prog=f'{APP} uninstall', description='Remove what install created.')
+    ap.add_argument('--keep-identity', action='store_true',
+                    help='keep config.toml (this node\'s private key), contacts.mesh and channels.json')
+    ap.add_argument('--purge', action='store_true', help=f'also remove chat history and UI settings ({CONFIG_DIR})')
+    ap.add_argument('-y', '--yes', action='store_true', help='do not ask for confirmation')
+    opts = ap.parse_args(argv)
+
+    home = os.path.realpath(HOME_DIR)
+    if home in ('/', os.path.realpath(os.path.expanduser('~'))) or not any(
+            os.path.exists(os.path.join(home, n)) for n in ('venv', 'meshcore-pi', 'config.toml')):
+        print(f'nothing to remove: {HOME_DIR} does not look like a {APP} install')
+        return 0
+    pids = _running_pids()
+    if pids:
+        raise SystemExit(f'{APP} or meshcore-pi is still running (pid {", ".join(map(str, pids))}); quit it first')
+
+    remove = [os.path.join(home, n) for n in sorted(os.listdir(home))
+              if not (opts.keep_identity and n in IDENTITY_FILES)]
+    link = os.path.join(os.path.expanduser('~/.local/bin'), APP)
+    if os.path.islink(link) and os.path.realpath(link) == os.path.realpath(__file__):
+        remove.append(link)
+    if opts.purge and os.path.isdir(CONFIG_DIR):
+        remove.append(CONFIG_DIR)
+    print('Will remove:')
+    for p in remove:
+        print('  ' + p)
+    if opts.keep_identity:
+        print(f'Keeping: {", ".join(n for n in IDENTITY_FILES if os.path.exists(os.path.join(home, n)))}')
+    elif os.path.exists(PI_CONFIG):
+        print(f'\nWarning: {PI_CONFIG} holds this node\'s private key. Removing it gives you a new identity,\n'
+              f'and others will see a new node. To keep it: {APP} uninstall --keep-identity')
+    print('The apt packages are left in place.')
+    if not opts.yes and input('Continue? [y/N] ').strip().lower() != 'y':
+        print('aborted')
+        return 1
+    for p in remove:
+        if os.path.islink(p) or os.path.isfile(p):
+            os.remove(p)
+        else:
+            shutil.rmtree(p)
+    if not opts.keep_identity:
+        try:
+            os.rmdir(home)
+        except OSError:
+            pass
+    print(f'Removed. Reinstall with: {os.path.realpath(__file__)} install')
+    return 0
+
+
 def _bootstrap():
     if sys.argv[1:2] in (['--version'], ['-V']):
         print(f'{APP} {__version__}')
         sys.exit(0)
     if sys.argv[1:2] in (['-h'], ['--help']):
-        print(f'usage: {APP}\n       {APP} install [--name NAME] [--key HEX] [-y]\n       {APP} --version\n')
+        print(f'usage: {APP}\n       {APP} install [--name NAME] [--key HEX] [-y]\n       {APP} uninstall [--keep-identity] [--purge] [-y]\n       {APP} --version\n')
         print(__doc__.split('State lives')[0].strip())
         sys.exit(0)
     if sys.argv[1:2] == ['install']:
         sys.exit(install(sys.argv[2:]))
+    if sys.argv[1:2] == ['uninstall']:
+        sys.exit(uninstall(sys.argv[2:]))
     if os.path.realpath(sys.prefix) != os.path.realpath(VENV_DIR):
         if not os.path.isfile(VENV_PY):
             sys.exit(f'{APP}: not set up yet. Run: {sys.argv[0]} install')

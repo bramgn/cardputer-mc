@@ -33,6 +33,18 @@ that does not read `~/.profile`; add it to `~/.bashrc`).
 Options: `--name NAME` (node name, default `Cardputer`), `--key HEX` (reuse an existing 32-byte
 private key instead of generating one), `-y`.
 
+## Uninstall
+
+```bash
+cardputer-mesh uninstall                  # asks first, then removes the venv, meshcore-pi, config, logs and the link
+cardputer-mesh uninstall --keep-identity  # keeps config.toml (the node key), contacts.mesh and channels.json
+cardputer-mesh uninstall --purge          # also removes chat history and UI settings in ~/.config/cardputer-mesh
+```
+
+It refuses to run while the app is open. The apt packages stay installed. Without `--keep-identity` the
+private key is deleted, so the next install is a new node; to keep the identity, copy the `privatekey` line
+from `config.toml` first and pass it to `install --key`.
+
 ## Use
 
 ```bash
