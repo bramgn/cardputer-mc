@@ -53,6 +53,167 @@ PI_DIR = os.path.join(HOME_DIR, 'meshcore-pi')
 PI_CONFIG = os.path.join(HOME_DIR, 'config.toml')
 PI_REPO = 'https://github.com/brianwiddas/meshcore-pi'
 PI_COMMIT = '85de8dc'                    # the version this client was tested with
+PI_PATCH = r'''diff --git a/basicmesh.py b/basicmesh.py
+index 08f0c19..083cc39 100644
+--- a/basicmesh.py
++++ b/basicmesh.py
+@@ -180,7 +180,7 @@ class BasicMesh:
+             # See BaseChatMesh::onPeerDataRecv in Meshcore
+             if rx_packet.is_flood():
+                 # If the packet is flooded to us, respond with a PATH (without the ACK)
+-                path_ack = packet.MC_Path_Out(self.me, rx_packet.source, rx_packet.path)
++                path_ack = packet.MC_Path_Out(self.me, rx_packet.source, rx_packet.path, hashsize=rx_packet.hashsize)
+                 logger.debug("Responding to flood CLI_DATA message with PATH")
+             else:
+                 logger.debug("Direct CLI_DATA message, no response")
+@@ -190,7 +190,7 @@ class BasicMesh:
+             ackhash = rx_packet.message_ackhash()
+ 
+             if rx_packet.is_flood():
+-                path_ack = packet.MC_Path_Out(self.me, rx_packet.source, rx_packet.path, ackhash)
++                path_ack = packet.MC_Path_Out(self.me, rx_packet.source, rx_packet.path, ackhash, hashsize=rx_packet.hashsize)
+                 logger.debug("Responding to flood message with PATH+ACK")
+             else:
+                 path_ack = packet.MC_Ack_Outgoing(rx_packet, rx_packet.source.path)
+@@ -292,7 +292,9 @@ class BasicMesh:
+             if isinstance(receivedpacket, packet.MC_Path) and receivedpacket.decrypted:
+                 logger.debug(f"Received path from {receivedpacket.source.name}: {pathstr(receivedpacket.pathdata)}")
+                 id = receivedpacket.source
+-                id.path = receivedpacket.pathdata
++                # Stored paths are sent as 1-byte hashes, so only keep paths that were
++                if receivedpacket.pathhashsize == 1:
++                    id.path = receivedpacket.pathdata
+                 self.ids.add_identity(id)
+                 # Callback to UI update path?
+ 
+diff --git a/interfaces/lorainterface.py b/interfaces/lorainterface.py
+index 8b1e659..4ad7d03 100644
+--- a/interfaces/lorainterface.py
++++ b/interfaces/lorainterface.py
+@@ -118,6 +118,12 @@ class LoRaInterface(Interface):
+         if dio2_rfswitch:
+             self.LoRa.setDio2RfSwitch(True)
+ 
++        # LoRaRF's receive interrupt handler stores the IRQ status first and only then fetches the buffer
++        # length and start (over SPI). Its onReceive callback runs last, so wait for it in rx_thread;
++        # otherwise rx_thread reads a stale or half-updated buffer, and the two threads share the SPI bus.
++        self._rx_done = threading.Event()
++        self.LoRa.onReceive(self._rx_done.set)
++
+         self.LoRa.setLoRaPacket(self.LoRa.HEADER_EXPLICIT, 16, 255, True, False)
+         self.LoRa.setSyncWord(0x12)
+ 
+@@ -142,6 +148,10 @@ class LoRaInterface(Interface):
+         while True:
+             self.LoRa.wait()
+ 
++            # Let the interrupt handler finish (not set after a transmit, hence the timeout)
++            self._rx_done.wait(0.1)
++            self._rx_done.clear()
++
+             status = self.LoRa.status()
+             logger.debug(f"Status: {s[status]}")
+ 
+diff --git a/packet.py b/packet.py
+index c1ef922..08e6683 100644
+--- a/packet.py
++++ b/packet.py
+@@ -145,6 +145,8 @@ class MC_Packet:
+     def __init__(self):
+         self.header = 0
+         self.path = bytearray()
++        # Bytes per path hash. MeshCore >= 1.11 allows 1-3, encoded in the top two bits of the path length byte
++        self.hashsize = 1
+         self._payload = b''
+         self._computed_payload = b''
+ 
+@@ -167,7 +169,7 @@ class MC_Packet:
+     @property
+     def packet(self):
+         if self.route == self.ROUTE_DIRECT or self.route == self.ROUTE_FLOOD:
+-            packet = bytearray([self.header, self.pathlen]) + self.path + self.payload
++            packet = bytearray([self.header, self.pathlenbyte]) + self.path + self.payload
+             if len(packet) > self.MAX_PACKET_PAYLOAD:
+                 raise InvalidMeshcorePacket("Packet exceeds maximum payload size.")
+             return packet
+@@ -177,7 +179,12 @@ class MC_Packet:
+     # The path length, either of the received path (for flood packets), or the remaining path (for direct packets)
+     @property
+     def pathlen(self):
+-        return len(self.path)
++        return len(self.path) // self.hashsize
++
++    # The path length byte as it appears on the wire: hash size - 1 in the top two bits, hop count in the rest
++    @property
++    def pathlenbyte(self):
++        return ((self.hashsize - 1) << 6) | self.pathlen
+ 
+     # The payload of the packet
+     # Derived classes should set the computed payload
+@@ -266,7 +273,7 @@ class MC_Packet:
+         s = f"Packet class: {self.__class__.__name__}\nPacket Length: {len(self)}\n"
+         s += f"Route: {self.routename}, Path Length: {self.pathlen}"
+         if self.pathlen:
+-            s += ", path: " + ",".join( (f"{hop:02x}" for hop in self.path[0:self.pathlen]) ) 
++            s += ", path: " + ",".join( (f"{hop:02x}" for hop in self.path) ) 
+         s += "\n"
+         return s
+ 
+@@ -283,12 +290,14 @@ class MC_Incoming(MC_Packet):
+         if isinstance(packet, (bytes, bytearray)):
+             # Split the packet into header, path, and payload
+             self.header = packet[0]
+-            pathlen = packet[1]
+-            if pathlen > 63 or pathlen > (len(packet)-2):
++            hashsize = (packet[1] >> 6) + 1
++            pathbytes = (packet[1] & 0x3f) * hashsize
++            if hashsize > 3 or pathbytes > (len(packet)-2):
+                 raise InvalidMeshcorePacket("Path length too long")
+             
+-            self.path = bytearray(packet[2:2 + pathlen])
+-            self._payload = packet[2 + pathlen:]
++            self.hashsize = hashsize
++            self.path = bytearray(packet[2:2 + pathbytes])
++            self._payload = packet[2 + pathbytes:]
+             self.externalpayload = True
+             
+             # If we're a repeater, should we repeat this packet?
+@@ -629,11 +638,14 @@ class MC_Path(MC_SrcDest):
+ 
+         self.ackhash = None
+         self.response = None
++        self.pathhashsize = 1
+ 
+         if self.packetdata is not None:
+-            pathlen = self.packetdata[0]
++            # Path length byte: hash size - 1 in the top two bits, hop count in the rest
++            self.pathhashsize = (self.packetdata[0] >> 6) + 1
++            pathlen = (self.packetdata[0] & 0x3f) * self.pathhashsize
+             # If pathlen = 0 (direct), pathdata = []
+-            self.pathdata = self.packetdata[0:pathlen]
++            self.pathdata = self.packetdata[1:1 + pathlen]
+ 
+             self.extra_type = None
+             # Gather up anything left after the path
+@@ -834,7 +846,7 @@ class MC_Path_Out(MC_SrcDest_Out):
+     * ackhash - optional ack hash for a received message
+     * response - optional response to req/anonreq
+     """
+-    def __init__(self, src, dest, returnpath, ackhash=None, response=None):
++    def __init__(self, src, dest, returnpath, ackhash=None, response=None, hashsize=1):
+         super().__init__(src, dest, self.TYPE_PATH)
+         
+         # Save these values in case we want to print the packet
+@@ -842,7 +854,7 @@ class MC_Path_Out(MC_SrcDest_Out):
+         self.ackhash = ackhash
+         self.response = response
+ 
+-        self.data = bytes([len(returnpath)]) + returnpath
++        self.data = bytes([((hashsize - 1) << 6) | (len(returnpath) // hashsize)]) + returnpath
+ 
+         if ackhash is not None:
+             self.data += bytes([self.TYPE_ACK]) + ackhash
+'''
 APT_PACKAGES = ['git', 'python3-venv', 'python3-rpi-lgpio', 'python3-lgpio']
 PIP_PACKAGES = ['meshcore', 'pycryptodome', 'aiotools', 'pyserial_asyncio', 'typing-extensions', 'LoRaRF']
 
@@ -139,10 +300,17 @@ def install(argv):
         raise SystemExit('python check failed:\n' + check.stderr.strip())
     print('  ok:', check.stdout.strip())
 
-    print('3/5 meshcore-pi')
+    print('3/5 meshcore-pi (pinned commit + local fixes)')
     if not os.path.isdir(os.path.join(PI_DIR, '.git')):
         _run(['git', 'clone', '-q', PI_REPO, PI_DIR])
     _run(['git', '-C', PI_DIR, 'checkout', '-q', PI_COMMIT])
+    # local fixes: MeshCore >= 1.11 multi-byte path hashes, and a receive race in the LoRa driver loop
+    if subprocess.run(['git', '-C', PI_DIR, 'apply', '--check', '-R', '-'], input=PI_PATCH, text=True,
+                      capture_output=True).returncode == 0:
+        print('  fixes already applied')
+    else:
+        subprocess.run(['git', '-C', PI_DIR, 'apply', '--whitespace=nowarn', '-'], input=PI_PATCH, text=True, check=True)
+        print('  applied fixes (multi-byte path hashes, RX race)')
 
     print('4/5 config')
     if os.path.exists(PI_CONFIG):

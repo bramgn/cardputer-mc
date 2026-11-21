@@ -21,7 +21,7 @@ git clone /srv/git/cardputer-mesh.git ~/git/cardputer-mesh
 
 1. installs the apt packages `git python3-venv python3-rpi-lgpio python3-lgpio` (asks first; `-y` skips the question),
 2. creates a venv in `~/.local/share/cardputer-mesh/venv` and pip-installs `meshcore`, `LoRaRF` and friends,
-3. clones meshcore-pi and checks out the tested commit (`85de8dc`),
+3. clones meshcore-pi, checks out the tested commit (`85de8dc`) and applies two small fixes (see below),
 4. writes `~/.local/share/cardputer-mesh/config.toml` with a fresh node identity (mode 600),
 5. links `~/.local/bin/cardputer-mesh` to the script.
 
@@ -48,6 +48,24 @@ on DIO3, RF switch on DIO2. In the EU, 869.4–869.65 MHz allows up to 27 dBm ER
 
 Changing TX power or the radio clock from inside the chat has no effect: meshcore-pi ignores those
 commands. Edit `config.toml` and reconnect.
+
+## Fixes applied to meshcore-pi
+
+`install` patches the pinned meshcore-pi checkout (the patch is embedded in the script; re-running
+`install` applies it to an existing install):
+
+- **Multi-byte path hashes.** MeshCore 1.11+ puts the hash size in the top two bits of the path-length
+  byte. Stock meshcore-pi rejects those packets as `Bad packet: Path length too long`, so anything
+  sent by newer phones, repeaters and companions was dropped. Now they parse.
+- **Receive race.** LoRaRF's interrupt handler updates the packet length and buffer start after it
+  sets the IRQ status, over the same SPI bus the receive loop uses. Packets could come out with the
+  wrong length or bytes (and zero-length packets). The receive loop now waits for the handler to finish.
+
+## First contact
+
+The node can only decrypt messages from contacts whose advert it has received. After a fresh install
+(new `contacts.mesh`), send an advert from your phone app (flood advert) and wait for the contact to
+appear in the Contacts tab before you expect private messages to arrive.
 
 ## Files
 
