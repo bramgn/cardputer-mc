@@ -13,9 +13,14 @@ version only talks to the local radio, so BLE, serial and TCP are gone.
 On the Cardputer (Raspberry Pi OS / Debian 13, SPI enabled, Cap-LoRa-1262 fitted):
 
 ```bash
-git clone /srv/git/cardputer-mesh.git ~/git/cardputer-mesh
-~/git/cardputer-mesh/cardputer-mesh install
+git clone https://github.com/bramgn/cardputer-mesh.git ~/git/cardputer-mesh
+~/git/cardputer-mesh/cardputer-mesh install --name YourName
 ```
+
+It is a single file, so you can also just download it:
+`curl -O https://raw.githubusercontent.com/bramgn/cardputer-mesh/master/cardputer-mesh && chmod +x cardputer-mesh && ./cardputer-mesh install`.
+Make sure `~/.local/bin` is on your `PATH` (the CardputerZero's built-in CLI app starts a non-login shell
+that does not read `~/.profile`; add it to `~/.bashrc`).
 
 `install` is safe to repeat. It:
 
@@ -80,3 +85,18 @@ Back up `config.toml`: it holds the node's private key.
 - meshcore-pi accepts one client at a time, so `mcorectl` and this app cannot be connected together.
 - meshcore-pi is a third-party project; its receive loop keeps one CPU core busy while the radio is on.
 - Tested on a real CardputerZero: install, start, connect to the radio, quit and cleanup (5V off, no stray process), in an 80x24 terminal over SSH. Not checked: the 320x170 built-in display, sending and receiving chat messages from inside the UI.
+
+## Before you use it
+
+- The pin mapping (RESET GPIO26, BUSY GPIO22, DIO1 GPIO23) was verified on a CardputerZero using
+  `cardputerzero-v5-overlay`. A different board revision may differ; this is untested.
+- Pick the frequency and TX power that are legal where you live, and that match the mesh you want to join.
+- A fresh install is a new node with its own private key (in `config.toml`). Never share that file.
+
+## Credits and license
+
+MIT, see `LICENSE`. The chat UI is derived from mcorechat. The script installs and patches
+[meshcore-pi](https://github.com/brianwiddas/meshcore-pi) (MIT, Copyright (c) 2025 Brian Widdas), which does
+the actual radio work; the embedded patch is a small modification of that project's code and falls under its
+license. It uses the [meshcore](https://pypi.org/project/meshcore/) Python library to talk to it, and
+[LoRaRF](https://pypi.org/project/LoRaRF/) for the SX1262.
