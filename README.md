@@ -1,4 +1,4 @@
-# cardputer-mesh
+# cardputer-mc
 
 A MeshCore chat client for the **M5 CardputerZero with the Cap-LoRa-1262** module. One Python file,
 no separate radio program: it starts [meshcore-pi](https://github.com/brianwiddas/meshcore-pi) as a
@@ -13,32 +13,39 @@ version only talks to the local radio, so BLE, serial and TCP are gone.
 On the Cardputer (Raspberry Pi OS / Debian 13, SPI enabled, Cap-LoRa-1262 fitted):
 
 ```bash
-git clone https://github.com/bramgn/cardputer-mesh.git ~/git/cardputer-mesh
-~/git/cardputer-mesh/cardputer-mesh install --name YourName
+git clone https://github.com/bramgn/cardputer-mc.git ~/git/cardputer-mc
+~/git/cardputer-mc/cardputer-mc install --name YourName
 ```
 
 It is a single file, so you can also just download it:
-`curl -O https://raw.githubusercontent.com/bramgn/cardputer-mesh/master/cardputer-mesh && chmod +x cardputer-mesh && ./cardputer-mesh install`.
+`curl -O https://raw.githubusercontent.com/bramgn/cardputer-mc/master/cardputer-mc && chmod +x cardputer-mc && ./cardputer-mc install`.
 Make sure `~/.local/bin` is on your `PATH` (the CardputerZero's built-in CLI app starts a non-login shell
 that does not read `~/.profile`; add it to `~/.bashrc`).
 
 `install` is safe to repeat. It:
 
 1. installs the apt packages `git python3-venv python3-rpi-lgpio python3-lgpio` (asks first; `-y` skips the question),
-2. creates a venv in `~/.local/share/cardputer-mesh/venv` and pip-installs `meshcore`, `LoRaRF` and friends,
+2. creates a venv in `~/.local/share/cardputer-mc/venv` and pip-installs `meshcore`, `LoRaRF` and friends,
 3. clones meshcore-pi, checks out the tested commit (`85de8dc`) and applies two small fixes (see below),
-4. writes `~/.local/share/cardputer-mesh/config.toml` with a fresh node identity (mode 600),
-5. links `~/.local/bin/cardputer-mesh` to the script.
+4. writes `~/.local/share/cardputer-mc/config.toml` with a fresh node identity (mode 600),
+5. links `~/.local/bin/cardputer-mc` to the script.
 
 Options: `--name NAME` (node name, default `Cardputer`), `--key HEX` (reuse an existing 32-byte
 private key instead of generating one), `-y`.
 
+## Renamed from cardputer-mesh
+
+The project used to be called `cardputer-mesh`. Running `cardputer-mc install` on a machine that has the old
+install moves `~/.local/share/cardputer-mesh` and `~/.config/cardputer-mesh` to the new names (keeping the node
+identity, contacts and history) and removes the old `~/.local/bin/cardputer-mesh` link. The environment variable
+is now `CARDPUTER_MC_HOME`.
+
 ## Uninstall
 
 ```bash
-cardputer-mesh uninstall                  # asks first, then removes the venv, meshcore-pi, config, logs and the link
-cardputer-mesh uninstall --keep-identity  # keeps config.toml (the node key), contacts.mesh and channels.json
-cardputer-mesh uninstall --purge          # also removes chat history and UI settings in ~/.config/cardputer-mesh
+cardputer-mc uninstall                  # asks first, then removes the venv, meshcore-pi, config, logs and the link
+cardputer-mc uninstall --keep-identity  # keeps config.toml (the node key), contacts.mesh and channels.json
+cardputer-mc uninstall --purge          # also removes chat history and UI settings in ~/.config/cardputer-mc
 ```
 
 It refuses to run while the app is open. The apt packages stay installed. Without `--keep-identity` the
@@ -48,16 +55,16 @@ from `config.toml` first and pass it to `install --key`.
 ## Use
 
 ```bash
-cardputer-mesh            # connects to the local radio on start; F1 shows the keys
-cardputer-mesh --version
+cardputer-mc            # connects to the local radio on start; F1 shows the keys
+cardputer-mc --version
 ```
 
 `/connect` reconnects, `/disconnect` stops the radio, F3 toggles. Chat history and UI settings are in
-`~/.config/cardputer-mesh/`.
+`~/.config/cardputer-mc/`.
 
 ## Radio settings
 
-Edit `~/.local/share/cardputer-mesh/config.toml` (frequency, bandwidth, spreading factor, coding
+Edit `~/.local/share/cardputer-mc/config.toml` (frequency, bandwidth, spreading factor, coding
 rate, TX power). Defaults are the EU/UK narrow preset: 869.618 MHz, 62.5 kHz, SF8, CR8, **14 dBm**.
 The pins are the CardputerZero's: SPI0 CS1, RESET = GPIO26, BUSY = GPIO22, DIO1 = GPIO23, TCXO 3.0 V
 on DIO3, RF switch on DIO2. In the EU, 869.4–869.65 MHz allows up to 27 dBm ERP; most of the rest of
@@ -86,7 +93,7 @@ appear in the Contacts tab before you expect private messages to arrive.
 
 ## Files
 
-State is in `~/.local/share/cardputer-mesh` (override with `CARDPUTER_MESH_HOME`): `config.toml`,
+State is in `~/.local/share/cardputer-mc` (override with `CARDPUTER_MC_HOME`): `config.toml`,
 `meshcore-pi/`, `venv/`, `contacts.mesh`, `channels.json`, `meshcore.log`, `local-radio.log`.
 Back up `config.toml`: it holds the node's private key.
 

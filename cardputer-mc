@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""cardputer-mesh: a MeshCore chat client for the M5 CardputerZero with the Cap-LoRa-1262 module.
+"""cardputer-mc: a MeshCore chat client for the M5 CardputerZero with the Cap-LoRa-1262 module.
 
-One file. `cardputer-mesh install` sets everything up once (apt packages, a venv, meshcore-pi,
-a config with a fresh identity); `cardputer-mesh` then starts meshcore-pi as a child process,
+One file. `cardputer-mc install` sets everything up once (apt packages, a venv, meshcore-pi,
+a config with a fresh identity); `cardputer-mc` then starts meshcore-pi as a child process,
 switches the module's 5V supply on, and runs the ncurses chat on top of it. Quitting stops
 meshcore-pi and switches the 5V supply off again.
 
@@ -10,12 +10,12 @@ meshcore-pi (https://github.com/brianwiddas/meshcore-pi) drives the SX1262 over 
 a MeshCore companion-radio interface on 127.0.0.1:5000; this client talks to it with the
 `meshcore` Python library. The chat UI is derived from mcorechat.
 
-State lives in ~/.local/share/cardputer-mesh (override with CARDPUTER_MESH_HOME):
+State lives in ~/.local/share/cardputer-mc (override with CARDPUTER_MC_HOME):
   config.toml       radio settings, name and private key of this node (mode 600)
   meshcore-pi/      the pinned meshcore-pi checkout
   venv/             Python environment for both
   contacts.mesh, channels.json, meshcore.log, local-radio.log
-Chat history and UI settings live in ~/.config/cardputer-mesh.
+Chat history and UI settings live in ~/.config/cardputer-mc.
 """
 
 import argparse
@@ -45,9 +45,9 @@ import sys
 # bootstrap: paths, installer, re-exec into the venv (stdlib only)
 # ======================================================================
 
-APP = 'cardputer-mesh'
+APP = 'cardputer-mc'
 __version__ = '0.1.0'
-HOME_DIR = os.path.expanduser(os.environ.get('CARDPUTER_MESH_HOME', '~/.local/share/cardputer-mesh'))
+HOME_DIR = os.path.expanduser(os.environ.get('CARDPUTER_MC_HOME', '~/.local/share/cardputer-mc'))
 VENV_DIR = os.path.join(HOME_DIR, 'venv')
 VENV_PY = os.path.join(VENV_DIR, 'bin', 'python')
 PI_DIR = os.path.join(HOME_DIR, 'meshcore-pi')
@@ -219,7 +219,7 @@ APT_PACKAGES = ['git', 'python3-venv', 'python3-rpi-lgpio', 'python3-lgpio']
 PIP_PACKAGES = ['meshcore', 'pycryptodome', 'aiotools', 'pyserial_asyncio', 'typing-extensions', 'LoRaRF']
 
 CONFIG_TEMPLATE = """\
-# meshcore-pi configuration for cardputer-mesh (M5 CardputerZero + Cap-LoRa-1262)
+# meshcore-pi configuration for cardputer-mc (M5 CardputerZero + Cap-LoRa-1262)
 interfaces = ["caplora"]
 devices = ["companion"]
 
@@ -266,6 +266,21 @@ def _run(cmd, **kw):
     subprocess.run(cmd, check=True, **kw)
 
 
+def _migrate_old_name():
+    """The project was called cardputer-mesh before: move its state and drop its old command link."""
+    old_home = os.path.expanduser('~/.local/share/cardputer-mesh')
+    old_config = os.path.expanduser('~/.config/cardputer-mesh')
+    old_link = os.path.expanduser('~/.local/bin/cardputer-mesh')
+    for old, new in ((old_home, HOME_DIR), (old_config, CONFIG_DIR)):
+        if os.path.isdir(old) and not os.path.exists(new):
+            os.makedirs(os.path.dirname(new), exist_ok=True)
+            os.rename(old, new)
+            print(f'  moved {old} -> {new}')
+    if os.path.islink(old_link):
+        os.remove(old_link)
+        print(f'  removed old command {old_link}')
+
+
 def install(argv):
     ap = argparse.ArgumentParser(prog=f'{APP} install', description='Set up meshcore-pi, a venv and a config.')
     ap.add_argument('--name', default='Cardputer', help='node name shown to others (default: Cardputer)')
@@ -274,6 +289,7 @@ def install(argv):
     opts = ap.parse_args(argv)
     if opts.key and not re.fullmatch(r'[0-9a-fA-F]{64}', opts.key):
         raise SystemExit('--key must be 64 hex characters')
+    _migrate_old_name()
     os.makedirs(HOME_DIR, exist_ok=True)
     if not os.path.exists('/dev/spidev0.1'):
         print('warning: /dev/spidev0.1 not found; is SPI enabled and is this a CardputerZero?')
@@ -337,12 +353,12 @@ def install(argv):
     return 0
 
 
-CONFIG_DIR = os.path.expanduser('~/.config/cardputer-mesh')      # chat history and UI settings
+CONFIG_DIR = os.path.expanduser('~/.config/cardputer-mc')      # chat history and UI settings
 IDENTITY_FILES = ('config.toml', 'contacts.mesh', 'channels.json')
 
 
 def _running_pids():
-    """pids of a running cardputer-mesh or of the meshcore-pi it started (other than this process)."""
+    """pids of a running cardputer-mc or of the meshcore-pi it started (other than this process)."""
     me, found = os.getpid(), []
     script = os.path.realpath(__file__)
     for entry in os.listdir('/proc'):
@@ -439,9 +455,9 @@ from meshcore.events import EventType
 # common
 # ======================================================================
 
-CONFIG_FILE = os.path.expanduser('~/.config/cardputer-mesh/config.json')
-HISTORY_FILE = os.path.expanduser('~/.config/cardputer-mesh/history.json')
-PASSWORDS_FILE = os.path.expanduser('~/.config/cardputer-mesh/passwords.json')   # opt-in, mode 0600
+CONFIG_FILE = os.path.expanduser('~/.config/cardputer-mc/config.json')
+HISTORY_FILE = os.path.expanduser('~/.config/cardputer-mc/history.json')
+PASSWORDS_FILE = os.path.expanduser('~/.config/cardputer-mc/passwords.json')   # opt-in, mode 0600
 RX_KEY = ('r', 0)           # 'Radio': received packets as a pseudo-conversation
 LOG_KEY = ('l', 0)          # 'Log': status messages and library log lines
 MAX_RETRIES = 5
