@@ -485,6 +485,7 @@ MAX_RETRIES = 5
 HISTORY_KEEP = 500          # messages kept per conversation
 SIDEBAR_W = 24               # the list's width on a roomy terminal
 MIN_SIDEBAR_W = 10           # ... and the least it shrinks to on a small one
+TIME_MIN_WIDTH = 44          # messages show their time (HH:MM) from this width; below it only the details window does
 MAX_CHANNELS = 8
 NODE_TYPES = {1: 'client', 2: 'repeater', 3: 'room'}
 CTRL_Q, CTRL_C = 17, 3
@@ -940,6 +941,37 @@ def battery_text(mv) -> str:
     if not mv:
         return 'n/a'
     return f'{mv} mV ({max(0, min(100, round((mv - 3000) / 1200 * 100)))}%)'
+
+
+def valid_mv(mv):
+    """A LiPo voltage in mV, or None: meshcore-pi has no battery gauge and reports 65535."""
+    return mv if isinstance(mv, int) and 2500 <= mv <= 5000 else None
+
+
+def local_battery():
+    """(percent, status, volts) of this machine's battery (the CardputerZero's bq27220), or None."""
+    try:
+        for name in sorted(os.listdir('/sys/class/power_supply')):
+            d = os.path.join('/sys/class/power_supply', name)
+            with open(os.path.join(d, 'type')) as f:
+                if f.read().strip() != 'Battery':
+                    continue
+            with open(os.path.join(d, 'capacity')) as f:
+                pct = int(f.read())
+            try:
+                with open(os.path.join(d, 'status')) as f:
+                    status = f.read().strip()
+            except OSError:
+                status = ''
+            try:
+                with open(os.path.join(d, 'voltage_now')) as f:
+                    volts = int(f.read()) / 1e6
+            except (OSError, ValueError):
+                volts = None
+            return max(0, min(100, pct)), status, volts
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def duration_text(secs: int) -> str:
@@ -1810,7 +1842,7 @@ class MessagingMixin:
             if m.mine and m.info.get('heard'):
                 mark = ' ✓'                   # heard back from at least one repeater; Enter shows how many
             body = f'{m.who}: {m.text}' if m.who else m.text
-            prefix = f'{hhmm(m.ts)} '
+            prefix = f'{hhmm(m.ts)} ' if width >= TIME_MIN_WIDTH else ''
             attr = (theme_NOTE if m.who == '*' else theme_FAIL if m.status == 'failed'
                     else theme_ME if m.mine else curses.A_NORMAL)
             wrapped = textwrap.wrap(body + mark, max(10, width - len(prefix)),
@@ -1913,10 +1945,20 @@ class SettingsMixin:
             async with self.radio_lock:
                 r = await self.mc.commands.get_bat()
             if r.type != EventType.ERROR:
-                self.radio_bat = r.payload.get('level')
-                self.dirty = True
+                self.radio_bat = valid_mv(r.payload.get('level'))
         except Exception as e:
             log.warning('battery: %s', e)
+        self.bat_local = local_battery()
+        self.dirty = True
+
+    def battery_title(self) -> str:
+        """'58%+' for the title bar (+ = charging): this machine's own battery, else the companion's."""
+        if self.bat_local:
+            pct, status, _ = self.bat_local
+            return f'{pct}%' + ('+' if status == 'Charging' else '')
+        if self.radio_bat:
+            return f'{max(0, min(100, round((self.radio_bat - 3000) / 12)))}%'
+        return ''
 
     async def radio_info(self):
         """Window with what the connected companion radio says about itself (no airtime)."""
@@ -1927,8 +1969,9 @@ class SettingsMixin:
             tm = await self.mc.commands.get_time()
         dev = dev.payload if dev.type != EventType.ERROR else {}
         bat = bat.payload if bat.type != EventType.ERROR else {}
-        mv = bat.get('level')
+        mv = valid_mv(bat.get('level'))
         self.radio_bat = mv
+        self.bat_local = local_battery()
         if tm.type != EventType.ERROR:
             diff = tm.payload.get('time', 0) - time.time()
             clock = 'in sync' if abs(diff) <= 5 else f'{abs(diff):.0f} s {"ahead of" if diff > 0 else "behind"} this computer'
@@ -1941,7 +1984,9 @@ class SettingsMixin:
             ('Firmware', ' '.join(x for x in (dev.get('ver'), f'({dev["fw_build"]})' if dev.get('fw_build') else '') if x) or '-'),
             ('Board', dev.get('model') or '-'),
             ('Protocol version', str(dev['fw ver']) if 'fw ver' in dev else '-'),
-            ('Battery', battery_text(mv)),
+            ('Battery', (f'{self.bat_local[0]}% {self.bat_local[1].lower()}'.rstrip()
+                         + (f', {self.bat_local[2]:.2f} V' if self.bat_local[2] else '')) if self.bat_local
+             else battery_text(mv)),
         ]
         if 'used_kb' in bat:
             rows.append(('Storage', f'{bat["used_kb"]} / {bat["total_kb"]} kB'))
@@ -3121,6 +3166,17 @@ class UiMixin:
         self.dirty = True
         return True
 
+    def fkey_labels(self, w: int) -> list[str]:
+        """The function key bar: 'F1 Help  F2 Options ...' when it fits, else bare names (' Help  Opts  Conn ...'):
+        on the small screen you reach the keys with Tab and Enter, so the F-numbers matter less (F1 lists them)."""
+        keys = [('F1', 'Help', 'Help'), ('F2', 'Options', 'Opts'),
+                ('F3', 'Disconnect' if self.mc else 'Connect', 'Disc' if self.mc else 'Conn'),
+                ('F7', 'Menu', 'Menu'), ('F8', 'Log', 'Log'), ('F9', 'RX log', 'RX'), ('F10', 'Quit', 'Quit')]
+        full = [f'{k} {v}' for k, v, _ in keys]
+        if 1 + sum(len(t) + 2 for t in full) - 2 <= w - 1:
+            return full
+        return [short for _, _, short in keys]
+
     @staticmethod
     def sidebar_width(w: int) -> int:
         """A quarter of the width, between MIN_SIDEBAR_W and SIDEBAR_W: a big terminal keeps the full list, the
@@ -3179,13 +3235,20 @@ class UiMixin:
 
         # title
         si = (self.mc.self_info if self.mc else None) or {}
-        title = f' {APP} {__version__} — {si["name"]} ' if si.get('name') else f' {APP} {__version__} '
-        if self.mc and self.radio_bat:
-            title += f'· bat {max(0, min(100, round((self.radio_bat - 3000) / 12)))}% '
-        if self.selected:
-            title += f'— {self.name_for(self.selected)} '
+        if w < 60:                          # small screen: the conversation and the battery, so the connection state fits
+            title = f' {self.name_for(self.selected)} ' if self.selected else f' {APP} '
+            if self.battery_title():
+                title += f'· {self.battery_title()} '
             if self.repeater_cli() == 'on':
                 title += '(CLI) '
+        else:
+            title = f' {APP} {__version__} — {si["name"]} ' if si.get('name') else f' {APP} {__version__} '
+            if self.battery_title():
+                title += f'· bat {self.battery_title()} '
+            if self.selected:
+                title += f'— {self.name_for(self.selected)} '
+                if self.repeater_cli() == 'on':
+                    title += '(CLI) '
         scr.addnstr(0, 0, ' ' * w, w - 1, theme_REV)
         scr.addnstr(0, 0, title, w - 1, theme_REV)
         conn = self.connection_text()          # the title bar only ever shows the connection state
@@ -3230,20 +3293,18 @@ class UiMixin:
                 hint = ('commands go to the repeater: ver, clock, advert, ...' if cli == 'on'
                         else 'not logged in: Esc, Enter, then "CLI" to manage this repeater')
                 scr.addnstr(h - 2, len(prompt), hint, max(0, w - 1 - len(prompt)), curses.A_DIM)
-        keys = [('F1', 'Help'), ('F2', 'Options'),
-                ('F3', 'Disconnect' if self.mc else 'Connect'),
-                ('F7', 'Menu'), ('F8', 'Log'), ('F9', 'RX log'), ('F10', 'Quit')]
+        labels = self.fkey_labels(w)
         scr.addnstr(h - 1, 0, ''.ljust(w), w - 1, theme_REV)
         first = 0
-        if self.focus == 'fkeys':             # on a narrow screen drop the leading keys until the chosen one fits
-            while first < self.fsel and 1 + sum(len(f'{k} {v}') + 2 for k, v in keys[first:self.fsel + 1]) > w - 1:
+        if self.focus == 'fkeys':             # on a very narrow screen drop the leading keys until the chosen one fits
+            while first < self.fsel and 1 + sum(len(t) + 2 for t in labels[first:self.fsel + 1]) > w - 1:
                 first += 1
         x = 1
-        for i, (k, v) in enumerate(keys[first:], first):
+        for i, text in enumerate(labels[first:], first):
             chosen = self.focus == 'fkeys' and i == self.fsel
-            scr.addnstr(h - 1, x, f'{k} {v}', max(0, w - 1 - x),
+            scr.addnstr(h - 1, x, text, max(0, w - 1 - x),
                         ((theme_REV ^ curses.A_REVERSE) | curses.A_BOLD) if chosen else theme_REV)
-            x += len(f'{k} {v}') + 2
+            x += len(text) + 2
             if x >= w - 1:
                 break
         scr.move(h - 2, min(w - 1, len(prompt) + self.pos - start))
@@ -3389,7 +3450,8 @@ class App(ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMixin, Channel
         self.help_scroll = 0
         self.passwords: dict[str, str] = self.load_passwords()   # repeater key prefix -> remembered password
         self.admin: set[str] = set()         # repeaters / rooms we are logged in to (key prefixes)
-        self.radio_bat: int | None = None        # companion battery in mV, for the title bar
+        self.radio_bat: int | None = None        # companion battery in mV (None when it has no gauge)
+        self.bat_local = local_battery()         # (percent, status, volts) of this machine, for the title bar
         self.node_stats: dict[str, tuple] = {}   # key prefix -> (time, status dict) from the last status request
         self.signal: dict[str, tuple] = {}   # key prefix -> (time, snr, rssi, source) from adverts
         self.radio_lock = asyncio.Lock()     # the library can't tell concurrent replies apart

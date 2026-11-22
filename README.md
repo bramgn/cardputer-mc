@@ -86,6 +86,12 @@ are ordinary letters.
 `/ping`. A line that starts with `:` followed by anything else (a smiley such as `:D`, `:)`) is still sent as a
 message; `::` at the start sends a literal `:`. Tab completes `:` commands too.
 
+On a small screen (under about 60 columns) the title bar shows just the conversation, the battery of the
+CardputerZero itself (`58%+`, the plus means charging) and the connection state; messages drop their `HH:MM`
+prefix (Enter shows the time in the details); and the function-key bar uses short names (`Help Opts Conn Menu
+Log RX Quit`, reachable with Tab and Enter) instead of `F1 Help  F2 Options ...`. On a wide terminal nothing
+changes.
+
 The list on the left takes a quarter of the width (10 to 24 columns): a wide terminal keeps the full list, the
 built-in 45-column screen gives the messages 33 columns instead of 20.
 
