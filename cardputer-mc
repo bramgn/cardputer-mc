@@ -305,6 +305,94 @@ index 4ad7d03..a45cf82 100644
      async def start(self):
          self.eventloop = asyncio.get_running_loop()
 '''
+
+PI_PATCH_BIN = r'''diff --git a/companionradio.py b/companionradio.py
+index b79dbcf..cc79a37 100644
+--- a/companionradio.py
++++ b/companionradio.py
+@@ -69,6 +69,7 @@ CMD_SEND_TELEMETRY_REQ = 39
+ CMD_GET_CUSTOM_VARS = 40
+ CMD_SET_CUSTOM_VAR = 41
+ CMD_GET_ADVERT_PATH = 42
++CMD_SEND_BINARY_REQ = 50
+ 
+ RESP_CODE_OK = 0
+ RESP_CODE_ERR = 1
+@@ -107,6 +108,7 @@ PUSH_CODE_LOG_RX_DATA = 0x88
+ PUSH_CODE_TRACE_DATA = 0x89
+ PUSH_CODE_NEW_ADVERT = 0x8A
+ PUSH_CODE_TELEMETRY_RESPONSE = 0x8B
++PUSH_CODE_BINARY_RESPONSE = 0x8C
+ 
+ ERR_CODE_UNSUPPORTED_CMD = 1
+ ERR_CODE_NOT_FOUND = 2
+@@ -181,6 +183,7 @@ class CompanionRadio(BasicMesh):
+         # The variables hold the public key of the target we've sent a ... request to
+         self.pending_login = None       # Target we tried to log in to
+         self.pending_status = None      # Target we sent a status request to
++        self.pending_binary = {}        # (pubkey, tag) -> time sent, for CMD_SEND_BINARY_REQ
+         self.pending_telemetry = None   # Target we sent a telemetry request to
+         self.pending_discovery = None   # Target we sent a discovery request to
+         self.pending_req = None         # Target we sent a binary request to
+@@ -520,6 +523,25 @@ class CompanionRadio(BasicMesh):
+         return sent_resp(statusreq, struct.pack("<L", statusreq.timestamp))
+ 
+ 
++    # Generic request (status, telemetry, neighbours, ...): the app supplies the request type and its data
++    async def send_binary_req(self, pubkey, reqdata):
++        dest = self.ids.find_by_pubkey(pubkey)
++        if dest is None:
++            return ERR(ERR_CODE_NOT_FOUND)
++        if len(reqdata) < 1:
++            return ERR(ERR_CODE_UNSUPPORTED_CMD)
++
++        req = packet.MC_Req_Out(self.me, dest, reqdata[0], bytes(reqdata[1:]))
++        tag = struct.pack("<L", req.timestamp)
++
++        now = time.time()
++        self.pending_binary = {k: t for k, t in self.pending_binary.items() if now - t < 180}
++        self.pending_binary[(bytes(dest.pubkey), tag)] = now
++
++        await self.transmit_packet(req)
++        # The answer comes later as PUSH_CODE_BINARY_RESPONSE; the tag is the request timestamp
++        return sent_resp(req, tag)
++
+     async def rx_response(self, packet:packet.MC_SrcDest):
+         # Packet is either a MC_Response or an MC_Path. Either will contain a
+         # 'response' property
+@@ -528,7 +550,14 @@ class CompanionRadio(BasicMesh):
+         timestamp = struct.unpack("<L", frame[0:4])[0]
+         # What response is this?
+         logger.debug(f"Got RESPONSE frame: {hexlify(frame).decode()}, timestamp: {timestamp} ({time.ctime(timestamp)})")
+-        if self.pending_login and self.pending_login == packet.source.pubkey:
++        if (bytes(packet.source.pubkey), bytes(frame[0:4])) in self.pending_binary:
++            del self.pending_binary[(bytes(packet.source.pubkey), bytes(frame[0:4]))]
++            # PUSH_CODE_BINARY_RESPONSE, 0 (reserved), tag (4 bytes), response data
++            msg = bytes([PUSH_CODE_BINARY_RESPONSE, 0]) + bytes(frame[0:4]) + bytes(frame[4:])
++            logger.info("Sending PUSH_CODE_BINARY_RESPONSE to app")
++            await self.appinterface.tx(msg)
++
++        elif self.pending_login and self.pending_login == packet.source.pubkey:
+             logger.debug("Received pending login response")
+             self.pending_login = None
+ 
+@@ -941,6 +970,15 @@ class CompanionRadio(BasicMesh):
+                     response = await self.send_status_req(pubkey)
+ 
+ 
++            elif command == CMD_SEND_BINARY_REQ:
++                # - device public key (32 bytes)
++                # - request type (1 byte) and its data
++                if len(frame) < 34:
++                    response = ERR(ERR_CODE_UNSUPPORTED_CMD)
++                else:
++                    logger.debug(f"CMD_SEND_BINARY_REQ, to: {hexlify(frame[1:33]).decode()}, request: {hexlify(frame[33:]).decode()}")
++                    response = await self.send_binary_req(frame[1:33], frame[33:])
++
+             elif command == CMD_SEND_TRACE_PATH:
+                 # Send a trace
+                 # Data from the app consists of
+'''
 APT_PACKAGES = ['git', 'python3-venv', 'python3-rpi-lgpio', 'python3-lgpio']
 PIP_PACKAGES = ['meshcore', 'pycryptodome', 'aiotools', 'pyserial_asyncio', 'typing-extensions', 'LoRaRF']
 
@@ -438,7 +526,8 @@ def install(argv):
     _run(['git', '-C', PI_DIR, 'checkout', '-q', PI_COMMIT])
     # local fixes: MeshCore >= 1.11 multi-byte path hashes, and a receive race in the LoRa driver loop
     for name, patch in (('multi-byte path hashes, RX race', PI_PATCH), ('ACKs with extra bytes', PI_PATCH_ACK),
-                        ('TX power command (applied between packets, max 22)', PI_PATCH_TX)):
+                        ('TX power command (applied between packets, max 22)', PI_PATCH_TX),
+                        ('binary requests: status, telemetry, neighbours of repeaters', PI_PATCH_BIN)):
         if subprocess.run(['git', '-C', PI_DIR, 'apply', '--check', '-R', '-'], input=patch, text=True,
                           capture_output=True).returncode == 0:
             print(f'  fix already applied: {name}')
@@ -699,7 +788,7 @@ def _bootstrap():
         sys.exit(0)
     if sys.argv[1:2] in (['-h'], ['--help']):
         print(f'usage: {APP} [--remote [USER@]HOST]\n       {APP} [--remote HOST] send TARGET TEXT... | read [TARGET] | contacts | channels | info | advert | listen\n'
-              f'       {APP} check | up | stop | status\n       {APP} install [--client] [--name NAME] [--key HEX] [-y]\n'
+              f'       {APP} check | up [--keep] | keep [on|off] | sound [off|private|all|test] | stop | status\n       {APP} install [--client] [--name NAME] [--key HEX] [-y]\n'
               f'       {APP} uninstall [--keep-identity] [--purge] [-y]\n       {APP} --version   ({APP} COMMAND --help for details)\n')
         print(__doc__.split('State lives')[0].strip())
         sys.exit(0)
@@ -942,7 +1031,10 @@ def theme_init_colors(theme: str = 'blue'):
     curses.use_default_colors()
     for n, (fg, bg) in enumerate(pairs, 1):
         curses.init_pair(n, theme_col(fg), theme_col(bg))
-    curses.init_pair(10, theme_col('yellow'), theme_col('default'))
+    # favourites: a clear yellow. The basic 'yellow' (colour 3) shows as orange on many terminals, so use the 256-colour 226
+    # (or the bright yellow 11) when the terminal has them
+    fav = 226 if curses.COLORS >= 256 else 11 if curses.COLORS >= 16 else theme_col('yellow')
+    curses.init_pair(10, fav, theme_col('default'))
     theme_FAV = curses.color_pair(10)
     theme_REV = curses.color_pair(1)
     theme_SEL = curses.color_pair(2) | curses.A_BOLD
@@ -3128,9 +3220,9 @@ class CommandsMixin:
     COLON_COMMANDS = frozenset(('contact', 'ct', 'menu', 'actions', 'act', 'ping', 'info', 'reboot', 'theme', 'advert', 'find', 'search',
                                 'trace', 'channel', 'ch', 'quit', 'exit', 'connect', 'disconnect', 'reload', 'options',
                                 'settings', 'clear', 'cls', 'log', 'console', 'radio', 'rx', 'rxlog', 'repeaters',
-                                'help', 'q', 'h', '?', 'keep', 'stop'))
+                                'help', 'q', 'h', '?', 'keep', 'stop', 'sound'))
     COMMAND_NAMES = ('act', 'actions', 'advert', 'channel', 'clear', 'connect', 'contact', 'disconnect', 'help', 'info', 'log', 'menu', 'quit',
-                     'reload', 'repeaters', 'ping', 'radio', 'reboot', 'search', 'options', 'theme', 'trace', 'keep', 'stop')
+                     'reload', 'repeaters', 'ping', 'radio', 'reboot', 'search', 'options', 'theme', 'trace', 'keep', 'stop', 'sound')
 
     def complete(self):
         """Tab completion for /commands in the input line."""
@@ -3211,6 +3303,20 @@ class CommandsMixin:
                                if self.keep_daemon else 'the radio switches off 20 s after the last window closes')
             self.dirty = True
             return
+        if name == 'sound':
+            word = arg.strip().lower()
+            if word == 'test':
+                err = await asyncio.to_thread(play_chime_now, 'private')
+                self.status = err or 'played the chime'
+            elif word not in ('',) + SOUND_MODES:
+                self.status = 'usage: /sound [off|private|all|test]'
+            else:
+                if word:
+                    self.sound = word
+                self.status = {'off': 'sound off', 'private': 'sound on for private messages',
+                               'all': 'sound on for private and channel messages'}[self.sound]
+            self.dirty = True
+            return
         if name == 'stop':
             self.keep_daemon = False
             self.save_config()
@@ -3283,6 +3389,7 @@ class CommandsMixin:
         ('^Q', 'quit immediately'),
         ('/keep [on|off]', 'keep the radio running when the last window closes (messages keep coming in)'),
         ('/stop', 'switch the radio off for good (all windows) and quit this one'),
+        ('/sound [off|private|all|test]', 'chime on a new message, played by the radio daemon (default: private messages only)'),
         ('^C, Alt-X, Alt-Q', 'ask whether to quit, like F8; the same key again, y or Enter says yes'),
         ('^A ^E', 'start / end of line'),
         ('^B ^F', 'cursor left / right'),
@@ -3674,12 +3781,20 @@ class UiMixin:
     def fkey_slots(self, w: int) -> list[tuple[int, int, str]]:
         """The function-key bar as (x, width, text). The built-in keyboard has five keys (4 to 8) fully under
         the screen, so the bar is five slots in a row, each name centred over its key; Fn+4 ... Fn+8 press them.
-        A wide terminal gets wider slots and the key name too ('F4 Help')."""
-        slot = max(5, min(w // 5, 8 if w < 70 else 14))
+        A normal (wide) terminal gets a left-aligned bar with the key names instead ('F1 Help  F2 Options ...')."""
+        if w >= 70:                                   # a normal terminal: left-aligned, with the usual function keys
+            keys = ('F1', 'F2', 'F6', 'F7', 'F10')        # F1 / F2 / F10 do the same as F4 / F5 / F8
+            out, x = [], 0
+            for i, (long, _short) in enumerate(self.BAR):
+                text = f' {keys[i]} {long} '
+                out.append((x, len(text), text))
+                x += len(text) + 1
+            return out
+        slot = max(5, min(w // 5, 8))
         x0 = max(0, (w - 5 * slot) // 2) + 1          # one column right of centre: that is where the keys sit
         out = []
         for i, (long, short) in enumerate(self.BAR):
-            name = f'{self.FKEYS[i]} {long}' if slot >= 11 else (short if slot < 8 else long)
+            name = short if slot < 8 else long
             out.append((x0 + i * slot, slot, name[:slot - 1].center(slot)))
         return out
 
@@ -3860,6 +3975,22 @@ class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMi
         return self._status
 
     @property
+    def keep_daemon(self) -> bool:                # keep the radio on when the last window closes (shared: file, not memory)
+        return _keep_daemon()
+
+    @keep_daemon.setter
+    def keep_daemon(self, value: bool):
+        set_setting('keep_daemon', bool(value))
+
+    @property
+    def sound(self) -> str:                       # 'off' | 'private' | 'all', played by the daemon on a new message
+        return sound_mode()
+
+    @sound.setter
+    def sound(self, value: str):
+        set_setting('sound', value)
+
+    @property
     def show_repeaters(self) -> bool:
         return self._show_repeaters
 
@@ -3870,7 +4001,7 @@ class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMi
 
     def save_config(self):
         cfg = {'show_repeaters': self._show_repeaters, 'auto_connect': self.auto_connect,
-               'keep_daemon': self.keep_daemon, 'theme': self.theme, 'favorites': sorted(self.favorites), 'channels': self.chan_prefs, 'retries': self.retries,
+               'keep_daemon': self.keep_daemon, 'sound': self.sound, 'theme': self.theme, 'favorites': sorted(self.favorites), 'channels': self.chan_prefs, 'retries': self.retries,
                'collapsed': sorted(self.collapsed), 'fav_only': self.fav_only, 'contact_sort': self.contact_sort}
         try:
             os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
@@ -3938,7 +4069,6 @@ class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMi
         cfg = load_config()
         self._show_repeaters = bool(cfg.get('show_repeaters', True))
         self.auto_connect = bool(cfg.get('auto_connect', True))
-        self.keep_daemon = bool(cfg.get('keep_daemon', False))     # keep the radio on when the last window closes
         self.favorites: set[str] = set(cfg.get('favorites', []))     # contact key prefixes (12 hex)
         self.chan_prefs: dict[str, dict] = cfg.get('channels') if isinstance(cfg.get('channels'), dict) else {}
         self.retries = max(0, min(MAX_RETRIES, int(cfg.get('retries', 1))))
@@ -4261,11 +4391,75 @@ async def _read_frame(reader, prefix: bytes) -> bytes:
 
 
 def _keep_daemon() -> bool:
+    return bool(load_config().get('keep_daemon'))
+
+
+SOUND_MODES = ('off', 'private', 'all')
+STATUS_FILE = os.path.join(HOME_DIR, 'daemon.status')
+SOUND_DIR = os.path.join(HOME_DIR, 'sounds')
+
+
+def set_setting(name: str, value):
+    """Change one key of the shared config file (read-modify-write, so other settings and other windows are not touched)."""
+    cfg = load_config()
+    cfg[name] = value
     try:
-        with open(CONFIG_FILE) as f:
-            return bool(json.load(f).get('keep_daemon'))
-    except (OSError, ValueError):
-        return False
+        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+        with open(CONFIG_FILE + '.tmp', 'w') as f:
+            json.dump(cfg, f, indent=1)
+        os.replace(CONFIG_FILE + '.tmp', CONFIG_FILE)
+    except OSError as e:
+        log.warning('could not save the settings: %s', e)
+
+
+def sound_mode() -> str:
+    mode = load_config().get('sound', 'private')
+    return mode if mode in SOUND_MODES else 'private'
+
+
+def sound_device() -> list:
+    """aplay arguments for the CardputerZero's own codec (the first sound card that is not HDMI)."""
+    dev = os.environ.get('CARDPUTER_MC_SOUND_DEVICE')
+    if dev:
+        return [] if dev == 'default' else ['-D', dev]
+    try:
+        with open('/proc/asound/cards') as f:
+            for line in f:
+                m = re.match(r'\s*(\d+)\s+\[(\S+)\s*\]', line)
+                if m and 'hdmi' not in m.group(2).lower():
+                    return ['-D', f'plughw:{m.group(1)},0']
+    except OSError:
+        pass
+    return []
+
+
+def chime_file(kind: str) -> str:
+    """A short wav for a private message (two rising tones) or a channel message (one low tone); made on first use."""
+    import wave, struct
+    path = os.path.join(SOUND_DIR, f'{kind}.wav')
+    if not os.path.exists(path):
+        os.makedirs(SOUND_DIR, exist_ok=True)
+        rate, out = 16000, []
+        for freq, dur in (((880, 0.09), (1319, 0.14)) if kind == 'private' else ((587, 0.12),)):
+            n = int(rate * dur)
+            out += [int(9000 * min(1, i / 200, (n - i) / 400) * math.sin(2 * math.pi * freq * i / rate)) for i in range(n)]
+        with wave.open(path, 'wb') as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(b''.join(struct.pack('<h', v) for v in out))
+    return path
+
+
+def play_chime_now(kind: str = 'private') -> str | None:
+    """Play a chime and wait for it (the `sound test`); returns an error text, or None."""
+    try:
+        r = subprocess.run(['aplay', '-q'] + sound_device() + [chime_file(kind)], capture_output=True, text=True, timeout=10)
+    except FileNotFoundError:
+        return 'aplay not found (install alsa-utils)'
+    except (OSError, subprocess.SubprocessError) as e:
+        return str(e)
+    return r.stderr.strip() or None if r.returncode else None
 
 
 class _Client:
@@ -4312,6 +4506,9 @@ class Daemon:
         self.up_reader = self.up_writer = None
         self.had_client = False
         self.idle_since = time.time()
+        self.started = time.time()
+        self.last_chime = 0.0
+        self.no_sound = False
         self.sock = None
 
     # ---- messages nobody has picked up yet, kept across a restart of the daemon
@@ -4375,7 +4572,40 @@ class Daemon:
                     else:
                         break
 
+    def _chime(self, frame: bytes):
+        """A sound for a new message: private (two tones) or channel (one tone), by the /sound setting."""
+        mode = sound_mode()
+        private = frame[0] in (7, 16)
+        if mode == 'off' or (mode == 'private' and not private):
+            return
+        txt_type = frame[11] if frame[0] == 16 else frame[8] if frame[0] == 7 else 0
+        now = time.time()
+        if txt_type != 0 or now - self.last_chime < 2.0 or self.no_sound:      # repeater replies and bursts stay quiet
+            return
+        self.last_chime = now
+
+        async def play():
+            try:
+                proc = await asyncio.create_subprocess_exec('aplay', '-q', *sound_device(), chime_file('private' if private else 'channel'),
+                                                            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
+                                                            stderr=asyncio.subprocess.DEVNULL)
+                await proc.wait()
+            except (OSError, ValueError) as e:
+                log.warning('no sound: %s', e)
+                self.no_sound = True
+        asyncio.create_task(play())
+
+    def _write_status(self):
+        try:
+            with open(STATUS_FILE + '.tmp', 'w') as f:
+                json.dump({'pid': os.getpid(), 'started': self.started, 'written': time.time(), 'windows': len(self.clients),
+                           'inbox': len(self.inbox)}, f)
+            os.replace(STATUS_FILE + '.tmp', STATUS_FILE)
+        except OSError:
+            pass
+
     def _deliver(self, frame: bytes):
+        self._chime(frame)
         if self.clients:
             for c in list(self.clients):
                 c.queue.append(frame)
@@ -4424,6 +4654,7 @@ class Daemon:
         while True:
             await asyncio.sleep(2)
             ticks += 1
+            self._write_status()
             if ticks % 15 == 0:               # meshcore-pi drops a client that stays silent for 90 s
                 async with self.lock:
                     await self._request(b'\x14')                          # battery
@@ -4614,8 +4845,22 @@ def stop_daemon() -> int:
 
 def daemon_status() -> int:
     pid = daemon_pid()
-    print(f'radio daemon: running (pid {pid}), keep running when closed: {"on" if _keep_daemon() else "off"}'
-          if pid else 'radio daemon: not running')
+    if not pid:
+        print('radio daemon: not running')
+        return 1
+    st = {}
+    try:
+        with open(STATUS_FILE) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        pass
+    up = ''
+    if st.get('pid') == pid and time.time() - st.get('written', 0) < 30:
+        secs = int(time.time() - st['started'])
+        up = f', up {secs // 3600}h{secs % 3600 // 60:02d}m' if secs >= 3600 else f', up {secs // 60}m{secs % 60:02d}s'
+    print(f'radio daemon: running (pid {pid}{up}), keep running when closed: {"on" if _keep_daemon() else "off"}')
+    if up:
+        print(f'windows: {st.get("windows", 0)}   inbox: {st.get("inbox", 0)} waiting   sound: {sound_mode()}')
     return 0
 
 
@@ -4947,7 +5192,12 @@ def main():
     sub = ap.add_subparsers(dest='command', metavar='command', description='without a command the chat starts')
     sub.add_parser('check', help='test the SX1262 wiring (no airtime)')
     sub.add_parser('daemon', help='run the radio daemon in the foreground (chat windows start it by themselves)')
-    sub.add_parser('up', help='start the radio daemon if it is not running, then exit')
+    sp = sub.add_parser('up', help='start the radio daemon if it is not running, then exit')
+    sp.add_argument('--keep', action='store_true', help='also keep it running when no window is open (like: keep on)')
+    sp = sub.add_parser('keep', help='keep the radio daemon running when no window is open: keep on | off (no argument: show)')
+    sp.add_argument('mode', nargs='?', choices=['on', 'off'])
+    sp = sub.add_parser('sound', help='chime on a new message, played by the daemon: sound off | private | all | test')
+    sp.add_argument('mode', nargs='?', choices=list(SOUND_MODES) + ['test'])
     sub.add_parser('stop', help='stop the radio daemon and switch the radio off')
     sub.add_parser('status', help='is the radio daemon running')
     sp = sub.add_parser('send', help='send a message: send Yoshi "hello", send "#test" hi there (TEXT - reads stdin)')
@@ -4976,19 +5226,36 @@ def main():
     sub.add_parser('uninstall', help='remove what install made')
     opts = ap.parse_args()
     command = opts.command
-    if opts.remote and command in ('check', 'daemon', 'up', 'stop', 'status'):
+    if opts.remote and command in ('check', 'daemon', 'up', 'stop', 'status', 'keep', 'sound'):
         sys.exit(f'{APP}: {command} works on the machine that has the radio; use: ssh {opts.remote} {APP} {command}')
     if opts.remote:
         try:
             open_tunnel(opts.remote)
         except RuntimeError as e:
             sys.exit(f'{APP}: {e}')
-    if command == 'up':
+    if command == 'sound':
+        if opts.mode == 'test':
+            err = play_chime_now('private')
+            sys.exit(f'{APP}: {err}' if err else 0)
+        if opts.mode:
+            set_setting('sound', opts.mode)
+        print(f'sound: {sound_mode()}')
+        sys.exit(0)
+    if command in ('up', 'keep'):
+        if command == 'keep' and opts.mode is None:
+            print(f'keep running when closed: {"on" if _keep_daemon() else "off"}')
+            sys.exit(0)
+        keep = opts.keep if command == 'up' else opts.mode == 'on'
+        if command == 'keep' or opts.keep:
+            set_setting('keep_daemon', keep)
+        if command == 'keep' and not keep:
+            print('keep running when closed: off (the daemon stops a minute after the last window)')
+            sys.exit(0)
         try:
             asyncio.run(ensure_daemon())
         except RuntimeError as e:
             sys.exit(f'{APP}: {e}')
-        print('radio daemon: running')
+        print('radio daemon: running' + (', and it stays running when no window is open' if _keep_daemon() else ''))
         sys.exit(0)
     if command in ('send', 'read', 'contacts', 'channels', 'info', 'advert', 'listen'):
         sys.exit(run_cli(globals()['cmd_' + command], opts))

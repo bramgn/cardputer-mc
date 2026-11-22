@@ -97,8 +97,8 @@ On a small screen (under about 60 columns) the title bar shows just the conversa
 CardputerZero itself (`58%+`, the plus means charging) and the connection state; messages drop their `HH:MM`
 prefix (Enter shows the time in the details); and the function-key bar is five slots,
 each centred above the keyboard key that presses it (`Fn`+4 to 8, the five keys that sit fully under the
-screen: Help, Options, Actions, Advert, Quit; Tab and Enter work too). A wide terminal shows the key names
-(`F4 Help`). `F1`/`F2`/`F10` still work as before, `F3` connects or disconnects, `F9` shows the radio log.
+screen: Help, Options, Actions, Advert, Quit; Tab and Enter work too). A normal terminal (70+ columns) gets a left-aligned bar
+(`F1 Help  F2 Options  F6 Actions  F7 Advert  F10 Quit`). `F1`/`F2`/`F10` work on the Cardputer too, `F3` connects or disconnects, `F9` shows the radio log.
 
 The list on the left takes a quarter of the width (10 to 24 columns): a wide terminal keeps the full list, the
 built-in 45-column screen gives the messages 33 columns instead of 20.
@@ -159,6 +159,25 @@ daemon has no password of its own and only listens on the Cardputer's localhost:
 let the ssh login be the protection. The Cardputer needs `cardputer-mc` installed and `~/.local/bin/cardputer-mc`
 in place. The PC keeps its own chat history (it is not shared with the Cardputer's windows), and the title bar
 shows no battery (the PC's battery says nothing about the radio's).
+
+## Without a window: the daemon in the background
+
+```
+cardputer-mc up --keep      # start the radio daemon, detached, and keep it running when no window is open
+cardputer-mc status         # running? pid, uptime, open windows, messages waiting, sound
+cardputer-mc keep off       # back to: the daemon stops a minute after the last window
+cardputer-mc stop           # switch the radio off for good
+```
+
+With `keep on` the Cardputer terminal is free for other things while the radio keeps listening; messages that arrive
+meanwhile wait in the daemon's inbox and show up in the next window, in `cardputer-mc read` or `cardputer-mc listen`.
+The price is power: the radio's 5V rail and one CPU core stay on. `/keep on|off` and `/stop` do the same inside the chat.
+
+**Sound.** The daemon plays a chime on the Cardputer's speaker when a message arrives, also with no window open:
+two rising tones for a private message, one lower tone for a channel message. `cardputer-mc sound off|private|all|test`
+(or `/sound` in the chat); the default is `private` (channels can be busy). Repeater replies and bursts within two
+seconds stay quiet. It needs `aplay` (alsa-utils) and uses the first sound card that is not HDMI; set
+`CARDPUTER_MC_SOUND_DEVICE=plughw:1,0` to pick another.
 
 ## Staying connected
 
