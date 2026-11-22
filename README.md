@@ -78,6 +78,14 @@ is parked on Ctrl-Y), so `/q` always quits.
 Going from the list to the messages (Right, `c` or Tab) puts the cursor on the message that is on the same
 screen row as the list's cursor, or on the last message when that row is empty.
 
+Vim-style navigation works the same way: `h j k l` for left/down/up/right, `gg` and `G` for the top and bottom
+(list, messages, help, options, menus, search results), `Ctrl-D` / `Ctrl-U` for half a page. In the prompt these
+are ordinary letters.
+
+`:` also starts a command, like `/`: `:q`, `:quit`, `:help`, `:ping`, ... are the same as `/q`, `/quit`, `/help`,
+`/ping`. A line that starts with `:` followed by anything else (a smiley such as `:D`, `:)`) is still sent as a
+message; `::` at the start sends a literal `:`. Tab completes `:` commands too.
+
 The list on the left takes a quarter of the width (10 to 24 columns): a wide terminal keeps the full list, the
 built-in 45-column screen gives the messages 33 columns instead of 20.
 

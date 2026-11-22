@@ -1521,6 +1521,10 @@ class MessagingMixin:
             sr['sel'] = max(0, sr['sel'] - 10)
         elif k == curses.KEY_NPAGE:
             sr['sel'] = min(n - 1, sr['sel'] + 10)
+        elif k == curses.KEY_HOME:
+            sr['sel'] = 0
+        elif k == curses.KEY_END:
+            sr['sel'] = n - 1
         elif k == '\n':
             _, key, i, _m = sr['hits'][sr['sel']]
             self.search = None
@@ -1645,10 +1649,10 @@ class MessagingMixin:
                           (textwrap.wrap(m.text, 64) or ['']))
             else:
                 self.show('Message details', self.message_details(msgs[self.msg_sel]))
-        elif k in ('/', ' '):
+        elif k in ('/', ':', ' '):
             self.start_typing(k)
         elif isinstance(k, str) and (k.isprintable() or k == '\x7f'):
-            pass                          # other letters do not start a message; Enter, Space or / do
+            pass                          # other letters do not start a message; Enter, Space, / or : do
         else:
             return False
         self.dirty = True
@@ -2054,6 +2058,8 @@ class SettingsMixin:
             self.set_sel = max(0, self.set_sel - 1)
         elif k == curses.KEY_DOWN:
             self.set_sel = min(len(self.SETTINGS) - 1, self.set_sel + 1)
+        elif k in (curses.KEY_HOME, curses.KEY_END):
+            self.set_sel = 0 if k == curses.KEY_HOME else len(self.SETTINGS) - 1
         elif k in (curses.KEY_LEFT, curses.KEY_RIGHT) and which == 'theme':
             names = list(theme_THEMES)
             step = 1 if k == curses.KEY_RIGHT else -1
@@ -2541,6 +2547,8 @@ class ContactsMixin:
             self.cmenu_sel = max(0, self.cmenu_sel - 1)
         elif k == curses.KEY_DOWN:
             self.cmenu_sel = min(n - 1, self.cmenu_sel + 1)
+        elif k in (curses.KEY_HOME, curses.KEY_END):
+            self.cmenu_sel = 0 if k == curses.KEY_HOME else n - 1
         elif k == '\n':
             act = self.menu_actions()[self.cmenu_sel][1]
             self.cmenu_open = act in ('notify', 'keep')      # settings that cycle keep the menu open
@@ -2604,13 +2612,20 @@ class ContactsMixin:
 # ======================================================================
 
 class CommandsMixin:
+    # Words that make a line starting with ':' a command (":quit", ":help"), as with '/'. Single letters are left
+    # out, apart from q, h and ?, so smileys such as ":D" and ":p" stay messages; "::" sends a literal ':'.
+    COLON_COMMANDS = frozenset(('contact', 'ct', 'menu', 'ping', 'info', 'reboot', 'theme', 'advert', 'find', 'search',
+                                'trace', 'channel', 'ch', 'quit', 'exit', 'connect', 'disconnect', 'reload', 'options',
+                                'settings', 'clear', 'cls', 'log', 'console', 'radio', 'rx', 'rxlog', 'repeaters',
+                                'help', 'q', 'h', '?'))
     COMMAND_NAMES = ('advert', 'channel', 'clear', 'connect', 'contact', 'disconnect', 'help', 'info', 'log', 'menu', 'quit',
                      'reload', 'repeaters', 'ping', 'radio', 'reboot', 'search', 'options', 'theme', 'trace')
 
     def complete(self):
         """Tab completion for /commands in the input line."""
-        if not self.buf.startswith('/') or ' ' in self.buf or self.buf.startswith('//'):
+        if not self.buf.startswith(('/', ':')) or ' ' in self.buf or self.buf.startswith(('//', '::')):
             return
+        pre = self.buf[0]
         cyc = getattr(self, '_tab', None)
         if cyc and self.buf == cyc[2]:                 # repeated Tab: next match
             hits, i = cyc[0], (cyc[1] + 1) % len(cyc[0])
@@ -2618,25 +2633,27 @@ class CommandsMixin:
             word = self.buf[1:].lower()
             hits, i = [c for c in self.COMMAND_NAMES if c.startswith(word)], -1
             if not hits:
-                self.status = f'no command matches /{word}'
+                self.status = f'no command matches {pre}{word}'
                 return
             common = os.path.commonprefix(hits)
             if len(hits) > 1 and common == word:       # nothing more to add: start cycling
                 i = 0
             else:
-                self.buf = '/' + common
+                self.buf = pre + common
         if i >= 0:
-            self.buf = '/' + hits[i]
+            self.buf = pre + hits[i]
         self.pos = len(self.buf)
         self._tab = (hits, i, self.buf) if len(hits) > 1 else None
         if len(hits) > 1:
-            self.status = 'matches: ' + '  '.join('/' + c for c in hits)
+            self.status = 'matches: ' + '  '.join(pre + c for c in hits)
 
     async def submit(self, text: str):
         if not text:
             return
-        if not text.startswith('/') or text.startswith('//'):
-            await self.send(text[1:] if text.startswith('//') else text)
+        if text.startswith(':') and not text.startswith('::') and text[1:].split(' ', 1)[0] in self.COLON_COMMANDS:
+            text = '/' + text[1:]
+        if not text.startswith('/') or text.startswith('//') or text.startswith('::'):
+            await self.send(text[1:] if text.startswith(('//', '::')) else text)
             return
         name, _, arg = text[1:].partition(' ')
         name = name.lower()
@@ -2716,13 +2733,14 @@ class CommandsMixin:
         ('Keys', ''),
         ('Up / Down', 'move through the list on the left'),
         ('z c f x', 'left / right / up / down whenever you are not typing (the arrows sit on the Fn layer)'),
+        ('h j k l', 'the same, Vim style; G = end, gg = top, Ctrl-D / Ctrl-U = half page down / up'),
         ('PgUp / PgDn', 'scroll history'),
         ('Enter', 'in the list: write a message (channels, contacts) or open the menu (repeaters, Log, Radio); in the input: send'),
         ('F7', 'context menu of the selected item, from anywhere'),
         ('Tab', 'list > messages > function keys > list (messages: Up/Down, Enter = details, r = resend)'),
         ('Left / Right', 'list <-> messages; on the function keys: pick one, Enter presses it'),
         ('Esc', 'back to the list (from the input, the messages and the function keys)'),
-        ('Space, /', 'start typing from anywhere; / starts a command, so /q always quits'),
+        ('Space, / or :', 'start typing from anywhere; / or : starts a command, so /q or :q always quits'),
         ('F1', 'this help'),
         ('F2', 'options (name, TX power, advert, theme, ...)'),
         ('F3', 'choose device and connect / disconnect'),
@@ -2790,7 +2808,10 @@ class CommandsMixin:
 
 class UiMixin:
     # The CardputerZero keeps its arrow keys on the Fn layer. Where letters are not text, z c f x steer instead.
-    NAV_LETTERS = {'z': curses.KEY_LEFT, 'c': curses.KEY_RIGHT, 'f': curses.KEY_UP, 'x': curses.KEY_DOWN}
+    # Vim's h j k l, G (end) and Ctrl-D / Ctrl-U (half page) work the same way, and gg (home) takes two presses.
+    NAV_LETTERS = {'z': curses.KEY_LEFT, 'c': curses.KEY_RIGHT, 'f': curses.KEY_UP, 'x': curses.KEY_DOWN,
+                   'h': curses.KEY_LEFT, 'l': curses.KEY_RIGHT, 'k': curses.KEY_UP, 'j': curses.KEY_DOWN,
+                   'G': curses.KEY_END, '\x04': curses.KEY_NPAGE, '\x15': curses.KEY_PPAGE}
 
     def letters_are_text(self) -> bool:
         """True while typed letters are text: a question being answered, a setting being edited, the prompt."""
@@ -2805,9 +2826,17 @@ class UiMixin:
             self.repaint = True
             self.dirty = True
             return
-        if isinstance(k, str) and k in self.NAV_LETTERS and not self.confirm_quit and not self.confirm_remove \
-                and not self.letters_are_text():
-            k = self.NAV_LETTERS[k]
+        if isinstance(k, str) and not self.confirm_quit and not self.confirm_remove and not self.letters_are_text():
+            if k == 'g':
+                if not self.pending_g:
+                    self.pending_g = True             # first g: wait for the second
+                    return
+                self.pending_g, k = False, curses.KEY_HOME
+            else:
+                self.pending_g = False
+                k = self.NAV_LETTERS.get(k, k)
+        else:
+            self.pending_g = False
         if self.details is not None:
             self.dirty = True
             page = max(1, self.scr_h - 5)
@@ -2833,6 +2862,10 @@ class UiMixin:
                 self.help_scroll = max(0, self.help_scroll - 10)
             elif k == curses.KEY_NPAGE:
                 self.help_scroll += 10
+            elif k == curses.KEY_HOME:
+                self.help_scroll = 0
+            elif k == curses.KEY_END:
+                self.help_scroll = 10 ** 6
             else:
                 self.help_open = False
             self.dirty = True
@@ -2900,7 +2933,7 @@ class UiMixin:
             elif o in (CTRL_Q, CTRL_C):
                 self.quit = True
             elif k == '\t':
-                if self.buf.startswith('/') and ' ' not in self.buf:
+                if self.buf.startswith(('/', ':')) and ' ' not in self.buf:
                     self.complete()
                 elif self.history.get(self.selected):
                     self.focus = 'msgs'
@@ -2983,7 +3016,7 @@ class UiMixin:
             self.focus = 'side'
         elif k == '\n':
             await self.handle_key(getattr(curses, 'KEY_' + self.FKEYS[self.fsel]))
-        elif k in ('/', ' '):
+        elif k in ('/', ':', ' '):
             self.start_typing(k)
         elif isinstance(k, str) and k.isprintable():
             pass
@@ -3004,12 +3037,12 @@ class UiMixin:
         return min(rows.get(row, last), last)
 
     def start_typing(self, k: str):
-        """Space activates the prompt; / activates it with a new command, so /q always quits."""
+        """Space activates the prompt; / or : activates it with a new command, so /q (or :q) always quits."""
         self.focus = 'input'
-        if k == '/':                          # always a fresh command; a half-written draft is parked on Ctrl-Y
+        if k in ('/', ':'):                   # always a fresh command; a half-written draft is parked on Ctrl-Y
             if self.buf:
                 self.kill = self.buf
-            self.buf, self.pos = '/', 1
+            self.buf, self.pos = k, 1
 
     def can_chat(self) -> bool:
         """True when the selected item takes typed messages: a channel or a chat contact."""
@@ -3031,6 +3064,8 @@ class UiMixin:
             self.scroll += 5
         elif k == curses.KEY_NPAGE:
             self.scroll = max(0, self.scroll - 5)
+        elif k in (curses.KEY_HOME, curses.KEY_END):
+            self.select(self.entries()[0 if k == curses.KEY_HOME else -1][0])
         elif k == '\n':
             if self.can_chat():
                 self.focus = 'input'          # the prompt is only active after an explicit Enter
@@ -3044,10 +3079,10 @@ class UiMixin:
                 self.focus = 'fkeys'
         elif k in (curses.KEY_LEFT, '\x1b'):
             pass
-        elif k in ('/', ' '):
+        elif k in ('/', ':', ' '):
             self.start_typing(k)
         elif isinstance(k, str) and k.isprintable():
-            pass                              # other letters do not start a message; Enter, Space or / do
+            pass                              # other letters do not start a message; Enter, Space, / or : do
         elif isinstance(k, str) and not (len(k) == 1 and ord(k) in (CTRL_Q, CTRL_C)):
             return False
         else:
@@ -3297,6 +3332,7 @@ class App(ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMixin, Channel
         self.set_sel = 0
         self.focus = 'side'                  # 'side' (list) | 'input' | 'msgs' | 'fkeys' (function key bar)
         self.fsel = 0                        # highlighted entry of the function key bar
+        self.pending_g = False               # a single g waiting for its second one (gg = top)
         self.side_row: tuple = (None, 0)     # (item, screen row) of the selected list entry, as last drawn
         self.msg_rows: tuple = (None, {})    # (item, {screen row: message index}) of the messages, as last drawn
         self.chan_secrets: dict[int, str] = {}   # slot -> secret hex, from the last channel load
