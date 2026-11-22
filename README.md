@@ -158,8 +158,18 @@ Back up `config.toml`: it holds the node's private key.
 
 ## Before you use it
 
-- The pin mapping (RESET GPIO26, BUSY GPIO22, DIO1 GPIO23) was verified on a CardputerZero using
-  `cardputerzero-v5-overlay`. A different board revision may differ; this is untested.
+- The SX1262 pin mapping is **RESET GPIO26, BUSY GPIO22, DIO1/IRQ GPIO23, NSS = SPI0 CE1 (GPIO7, `/dev/spidev0.1`)**.
+  It matches the labels on the Cap-LoRa-1262 and on the CardputerZero's 2x7 header, column by column, and it was
+  verified on a running CardputerZero (`cardputerzero-v5-overlay`): RESET low makes BUSY go high, and packets are
+  received and sent.
+
+  | Cap-LoRa-1262 | RST | IRQ | BUSY | SCK | MOSI | MISO | NSS |
+  |---|---|---|---|---|---|---|---|
+  | CardputerZero header | G26 | G23 | G22 | G11 | G10 | G9 | G7 (CS1) |
+
+  The Cap's PI4IOE5V6408 expander (I2C address 0x43, on G2/G3) switches something in the RF path through its P0
+  pin ("BYPASS: EP0" on the label); cardputer-mc does not touch it. The GNSS module sits on the UART (G14/G15).
+  The pins are verified for this board only: another board revision (v3, ...) might differ.
 - Pick the frequency and TX power that are legal where you live, and that match the mesh you want to join.
 - A fresh install is a new node with its own private key (in `config.toml`). Never share that file.
 
