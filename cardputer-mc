@@ -2823,7 +2823,8 @@ class CommandsMixin:
         ('F9', 'Radio: every packet heard (Tab: select, Enter = details)'),
         ('F8', 'Log: status messages (lights up on problems)'),
         ('F10', 'quit (asks to confirm)'),
-        ('^Q, ^C', 'quit immediately'),
+        ('^Q', 'quit immediately'),
+        ('^C, Alt-X, Alt-Q', 'ask whether to quit, like F10; the same key again, y or Enter says yes'),
         ('^A ^E', 'start / end of line'),
         ('^B ^F', 'cursor left / right'),
         ('^U ^K ^W', 'kill to start / end / previous word'),
@@ -2897,11 +2898,27 @@ class UiMixin:
                  or self.settings_open or self.cmenu_open or self.advert_menu_open or self.search)
         return self.focus == 'input' and not modal
 
+    # Ctrl-C and Alt-X / Alt-Q (ESC + key) ask whether to quit; F10 does too. Ctrl-Q quits at once.
+    QUIT_KEYS = ('\x03', '\x1bx', '\x1bX', '\x1bq', '\x1bQ')
+
     async def handle_key(self, k):
         if k == '\x0c':                       # Ctrl-L: full repaint
             self.repaint = True
             self.dirty = True
             return
+        if self.confirm_quit:                 # the quit question beats everything else, windows included
+            if k in ('y', 'Y', '\n') or k in self.QUIT_KEYS:      # the shortcut again counts as yes
+                self.quit = True
+            elif k in ('n', 'N', '\x1b', curses.KEY_F10):
+                self.confirm_quit = False
+            self.dirty = True
+            return
+        if k in self.QUIT_KEYS:
+            self.confirm_quit = True
+            self.dirty = True
+            return
+        if isinstance(k, str) and len(k) == 2 and k[0] == '\x1b':
+            return                            # any other Alt combination does nothing
         if isinstance(k, str) and not self.confirm_quit and not self.confirm_remove and not self.letters_are_text():
             if k == 'g':
                 if not self.pending_g:
@@ -2944,13 +2961,6 @@ class UiMixin:
                 self.help_scroll = 10 ** 6
             else:
                 self.help_open = False
-            self.dirty = True
-            return
-        if self.confirm_quit:
-            if k in ('y', 'Y', '\n'):
-                self.quit = True
-            elif k in ('n', 'N', '\x1b', curses.KEY_F10):
-                self.confirm_quit = False
             self.dirty = True
             return
         if self.ask:
@@ -3604,6 +3614,20 @@ class App(ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMixin, Channel
 # cli
 # ======================================================================
 
+def read_key(scr):
+    """One key from curses. Alt+key arrives as ESC followed at once by the key: returned as '\\x1b' + key."""
+    k = scr.get_wch()
+    if k == '\x1b':
+        try:
+            nxt = scr.get_wch()
+        except curses.error:
+            return k                          # a lone Esc
+        if isinstance(nxt, str):
+            return k + nxt
+        curses.unget_wch(nxt)                 # Esc, then a function key
+    return k
+
+
 async def ui(scr, app: App):
     curses.curs_set(1)
     theme_init_colors(app.theme)
@@ -3611,7 +3635,7 @@ async def ui(scr, app: App):
     scr.keypad(True)
     while not app.quit:
         try:
-            k = scr.get_wch()
+            k = read_key(scr)
         except curses.error:
             k = None
         if k is None:

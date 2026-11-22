@@ -72,6 +72,10 @@ are usable without reaching for the tiny Fn row. Typing in the list, the message
 The arrow keys sit on the CardputerZero's Fn layer, so whenever you are not typing (not in the prompt, a question
 or a setting being edited) `z` `c` `f` `x` act as left, right, up and down, in the lists, menus and windows.
 
+Quitting: `Ctrl-C`, `Alt-X`, `Alt-Q` and `F10` ask `Quit? [y/n]` first (the same key again, `y` or Enter says yes, `n`
+or Esc cancels), also while a window is open; `Ctrl-Q` and `/q` quit at once. Alt is read as ESC followed by the
+key, which is what terminals send; in the Cardputer's own CLI app `cat -v` should show `^[x` for Alt-X.
+
 Space or `/` start typing from anywhere: Space continues what you were writing, `/` starts a new command (a draft
 is parked on Ctrl-Y), so `/q` always quits.
 
