@@ -59,6 +59,10 @@ cardputer-mc            # connects to the local radio on start; F1 shows the key
 cardputer-mc --version
 ```
 
+Marks after your own messages: ` ·` handed to the radio, ` ✓` delivered (private message, ACK received) or
+heard being repeated by at least one repeater (channel message), ` ✗` failed. Select a message and press
+Enter to see the details, including how many repeats were heard and through which repeaters.
+
 `/connect` reconnects, `/disconnect` stops the radio, F3 toggles. Chat history and UI settings are in
 `~/.config/cardputer-mc/`.
 

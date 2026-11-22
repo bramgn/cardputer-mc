@@ -1766,9 +1766,8 @@ class MessagingMixin:
         lines = []
         for n, m in enumerate(self.history.get(self.selected, [])):
             mark = {'sent': ' ·', 'acked': ' ✓', 'failed': ' ✗'}.get(m.status, '')
-            heard = len(m.info.get('heard', ())) if m.mine else 0
-            if heard:
-                mark = f' · heard {heard} repeat{"s" if heard != 1 else ""}'
+            if m.mine and m.info.get('heard'):
+                mark = ' ✓'                   # heard back from at least one repeater; Enter shows how many
             body = f'{m.who}: {m.text}' if m.who else m.text
             prefix = f'{hhmm(m.ts)} '
             attr = (theme_NOTE if m.who == '*' else theme_FAIL if m.status == 'failed'
