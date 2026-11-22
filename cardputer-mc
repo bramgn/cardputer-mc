@@ -1216,6 +1216,7 @@ class ConnectionMixin:
             await self.drain_queue(mc)
             self.save_config()
             self.status = f'connected to {self.target()}'
+            self.keepalive_task = asyncio.create_task(self.guarded(self.keepalive()))
         except BaseException as e:
             self.mc = None
             if mc is not None:
@@ -1231,7 +1232,18 @@ class ConnectionMixin:
             self.connecting = False
             self.dirty = True
 
+    async def keepalive(self):
+        """meshcore-pi drops a client that stays silent for 90 s (the phone app asks for the battery every minute).
+        Doing the same keeps the link up, and the battery in the title bar fresh."""
+        while self.mc is not None:
+            await asyncio.sleep(45)
+            if self.mc is not None:
+                await self.refresh_battery()
+
     async def disconnect(self, reason: str = 'disconnected'):
+        task, self.keepalive_task = self.keepalive_task, None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
         mc, self.mc = self.mc, None
         if mc is None:
             await self.stop_local()
@@ -1255,7 +1267,26 @@ class ConnectionMixin:
     async def on_disconnected(self, event):
         # device unplugged / link lost; skip our own manual disconnect
         if self.mc is not None:
-            asyncio.create_task(self.disconnect('connection lost'))
+            asyncio.create_task(self.guarded(self.connection_lost()))
+
+    async def connection_lost(self):
+        """The link broke without us asking (meshcore-pi died or dropped us): start again, a few times."""
+        log.warning('connection lost; reconnecting')
+        await self.disconnect('connection lost')
+        for n, wait in enumerate((2, 5, 15, 30, 60), 1):
+            self.status = f'connection lost; reconnecting in {wait}s ({n}/5)'
+            self.dirty = True
+            await asyncio.sleep(wait)
+            if self.quit or self.mc is not None or self.connecting:
+                return                            # quitting, or the user already reconnected
+            self.connect_to()
+            while self.connecting:
+                await asyncio.sleep(0.5)
+            if self.mc is not None:
+                log.info('reconnected')
+                return
+        self.status = 'could not reconnect: press F3 to try again'
+        self.dirty = True
 
     async def load_channels(self) -> int | None:
         """Refresh self.channels from the radio; returns the first free slot, if any."""
@@ -3332,6 +3363,7 @@ class App(ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMixin, Channel
         self.set_sel = 0
         self.focus = 'side'                  # 'side' (list) | 'input' | 'msgs' | 'fkeys' (function key bar)
         self.fsel = 0                        # highlighted entry of the function key bar
+        self.keepalive_task: asyncio.Task | None = None
         self.pending_g = False               # a single g waiting for its second one (gg = top)
         self.side_row: tuple = (None, 0)     # (item, screen row) of the selected list entry, as last drawn
         self.msg_rows: tuple = (None, {})    # (item, {screen row: message index}) of the messages, as last drawn

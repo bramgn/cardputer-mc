@@ -92,6 +92,13 @@ built-in 45-column screen gives the messages 33 columns instead of 20.
 `/connect` reconnects, `/disconnect` stops the radio, F3 toggles. Chat history and UI settings are in
 `~/.config/cardputer-mc/`.
 
+## Staying connected
+
+meshcore-pi drops a client that is silent for 90 seconds (the phone app asks for the battery every minute), which
+used to cut the link after a few idle minutes. cardputer-mc now does the same request every 45 seconds. If the
+link breaks anyway (meshcore-pi dies, the radio hangs), it restarts everything by itself, up to five times with
+growing pauses, and shows `reconnecting ...` in the title bar; F3 or `/connect` tries again by hand.
+
 ## Radio settings
 
 Edit `~/.local/share/cardputer-mc/config.toml` (frequency, bandwidth, spreading factor, coding
