@@ -393,6 +393,33 @@ index b79dbcf..cc79a37 100644
                  # Send a trace
                  # Data from the app consists of
 '''
+
+PI_PATCH_IMPORT = r'''diff --git a/companionradio.py b/companionradio.py
+index cc79a37..b27169f 100644
+--- a/companionradio.py
++++ b/companionradio.py
+@@ -812,6 +812,20 @@ class CompanionRadio(BasicMesh):
+                     await self.transmit_packet(advert)
+                     response = OK
+ 
++            elif command == CMD_IMPORT_CONTACT:
++                # The raw advert packet of a contact (what a meshcore:// link carries): add it like a received advert
++                logger.debug(f"CMD_IMPORT_CONTACT, {len(frame) - 1} bytes")
++                try:
++                    adv = packet.MC_Incoming.convert_packet(bytes(frame[1:]), self.me, self.ids, self.channels)
++                except Exception as e:
++                    logger.warning(f"Cannot import contact: {e}")
++                    adv = None
++                if not isinstance(adv, packet.MC_Advert) or not adv.advert.validate():
++                    response = ERR(ERR_CODE_ILLEGAL_ARG)
++                else:
++                    await self.rx_advert(adv)
++                    response = OK
++
+             elif command == CMD_SET_RADIO_PARAMS:
+                 logger.debug(f"CMD_SET_RADIO_PARAMS, {hexlify(frame[1:]).decode()}")
+ 
+'''
 APT_PACKAGES = ['git', 'python3-venv', 'python3-rpi-lgpio', 'python3-lgpio']
 PIP_PACKAGES = ['meshcore', 'pycryptodome', 'aiotools', 'pyserial_asyncio', 'typing-extensions', 'LoRaRF']
 
@@ -527,7 +554,8 @@ def install(argv):
     # local fixes: MeshCore >= 1.11 multi-byte path hashes, and a receive race in the LoRa driver loop
     for name, patch in (('multi-byte path hashes, RX race', PI_PATCH), ('ACKs with extra bytes', PI_PATCH_ACK),
                         ('TX power command (applied between packets, max 22)', PI_PATCH_TX),
-                        ('binary requests: status, telemetry, neighbours of repeaters', PI_PATCH_BIN)):
+                        ('binary requests: status, telemetry, neighbours of repeaters', PI_PATCH_BIN),
+                        ('import contact (meshcore:// links)', PI_PATCH_IMPORT)):
         if subprocess.run(['git', '-C', PI_DIR, 'apply', '--check', '-R', '-'], input=patch, text=True,
                           capture_output=True).returncode == 0:
             print(f'  fix already applied: {name}')
@@ -787,7 +815,7 @@ def _bootstrap():
         print(f'{APP} {__version__}')
         sys.exit(0)
     if sys.argv[1:2] in (['-h'], ['--help']):
-        print(f'usage: {APP} [--remote [USER@]HOST]\n       {APP} [--remote HOST] send TARGET TEXT... | read [TARGET] | contacts | channels | info | advert | listen\n'
+        print(f'usage: {APP} [--remote [USER@]HOST]\n       {APP} [--remote HOST] send TARGET TEXT... | read [TARGET] | contacts | addcontact LINK | channels | info | advert | listen\n'
               f'       {APP} check | up [--keep] | keep [on|off] | sound [off|private|all|test] | stop | status\n       {APP} install [--client] [--name NAME] [--key HEX] [-y]\n'
               f'       {APP} uninstall [--keep-identity] [--purge] [-y]\n       {APP} --version   ({APP} COMMAND --help for details)\n')
         print(__doc__.split('State lives')[0].strip())
@@ -2567,6 +2595,8 @@ class SettingsMixin:
                 self.set_edit += k
         elif k in ('\x1b', curses.KEY_F2, curses.KEY_F5):
             self.settings_open = False
+        elif k == '\t':
+            self.set_sel = (self.set_sel + 1) % len(self.SETTINGS)
         elif k == curses.KEY_UP:
             self.set_sel = max(0, self.set_sel - 1)
         elif k == curses.KEY_DOWN:
@@ -2611,6 +2641,8 @@ class SettingsMixin:
             self.advert_menu_open = False
             back, self.advert_back = self.advert_back, None
             self.restore(back)
+        elif k == '\t':
+            self.advert_sel = (self.advert_sel + 1) % len(self.ADVERT_CHOICES)
         elif k == curses.KEY_UP:
             self.advert_sel = 0
         elif k == curses.KEY_DOWN:
@@ -2712,7 +2744,7 @@ class ContactsMixin:
         if name == 'Contacts':
             return ((f'Sort: {self.SORTS[self.contact_sort]}', 'sort'),
                     (f'Favorites only: {"on" if self.fav_only else "off"}', 'favonly'), rep_toggle, read,
-                    ('Remove stale contacts...', 'stale'), fold)
+                    ('Add contact...', 'newcontact'), ('Remove stale contacts...', 'stale'), fold)
         if name == 'Repeaters':
             return (rep_toggle, read, fold)
         return (('Clear Log', 'clearlog'), ('Clear Radio packets', 'clearrx'), read, fold)
@@ -2729,6 +2761,10 @@ class ContactsMixin:
             keys = [k for k, _ in self.groups().get(name, [])]
             n = sum(1 for k in keys if self.unread.pop(k, 0))
             self.status = f'{n} marked read' if n else 'nothing unread'
+        elif action == 'newcontact':
+            if self.need_radio():
+                self.ask = {'label': 'Paste a meshcore:// contact link', 'text': '',
+                            'cb': lambda text, _c: self.ask_add_contact(text), 'contact': None}
         elif action == 'stale':
             self.ask = {'label': 'Remove contacts (and repeaters) not heard for how many days?', 'text': '30',
                         'cb': lambda text, _c: self.ask_stale(text), 'contact': None}
@@ -3097,6 +3133,36 @@ class ContactsMixin:
         self.status = (f'path set for {c.get("adv_name", "?")}' if r.type != EventType.ERROR
                        else f'set path failed: {describe_error(r.payload)}')
 
+    async def ask_add_contact(self, text: str):
+        """Add contact...: a pasted meshcore:// link; shows who it is and asks before adding."""
+        try:
+            info = parse_contact_link(text)
+        except ValueError as e:
+            self.status = str(e)
+            return
+        if not self.need_radio():
+            return
+        if any(c['public_key'] == info['key'] for c in self.contacts().values()):
+            self.status = f'{info["name"]} is already in the contact list'
+            return
+        self.confirm_remove = {'label': f'Add {info["name"]} ({info["type"]}, key {info["key"][:8]})',
+                               'run': lambda: self.apply_add_contact(info)}
+        self.dirty = True
+
+    async def apply_add_contact(self, info: dict):
+        if not self.need_radio():
+            return
+        async with self.radio_lock:
+            r = await self.mc.commands.import_contact(info['raw'])
+            if r.type != EventType.ERROR:
+                await self.mc.ensure_contacts(follow=True)
+        if r.type == EventType.ERROR:
+            self.status = f'add failed: {describe_error(r.payload)}'
+        else:
+            self.status = f'added {info["name"]}'
+            self.select(('d', info['key'][:12]))
+        self.dirty = True
+
     async def ask_stale(self, text: str):
         """Contacts whose last advert is older than N days (never favourites, never one you have talked to) go after a yes."""
         try:
@@ -3153,6 +3219,8 @@ class ContactsMixin:
         n = len(self.menu_actions())
         if k in ('\x1b', curses.KEY_F6):
             self.cmenu_open = False
+        elif k == '\t':                                     # Tab walks through the entries, round to the top
+            self.cmenu_sel = (self.cmenu_sel + 1) % n
         elif k == curses.KEY_UP:
             self.cmenu_sel = max(0, self.cmenu_sel - 1)
         elif k == curses.KEY_DOWN:
@@ -3388,7 +3456,7 @@ class CommandsMixin:
         ('h j k l', 'the same, Vim style; G = end, gg = top, Ctrl-D / Ctrl-U = half page down / up'),
         ('PgUp / PgDn', 'scroll history'),
         ('Enter', 'in the list: write a message (channels, contacts), open the actions (repeaters, Log, Radio) or fold / unfold a heading (Channels, Contacts, ...); in the input: send'),
-        ('F6', 'Actions for the selected item (ping, trace, set path...), from anywhere; with the cursor on a heading: for the whole group (sort, favorites only, stale contacts, mark all read, add channel...)'),
+        ('F6', 'Actions for the selected item (ping, trace, set path...), from anywhere; with the cursor on a heading: for the whole group (sort, favorites only, add / remove stale contacts, mark all read, add channel...)'),
         ('Tab', 'each heading of the list (Channels, Contacts, Console) > messages > each key of the bar > first heading (messages: Up/Down, Enter = details, r = resend)'),
         ('Left / Right', 'list <-> messages; on the function keys: pick one, Enter presses it'),
         ('Esc', 'one step back: from the input, the messages or the function keys to where you came from (usually the list)'),
@@ -4941,6 +5009,32 @@ async def run(scr, args):
 # command line (no screen): send, read, contacts, ...
 # ======================================================================
 
+def parse_contact_link(text: str) -> dict:
+    """A meshcore:// contact link is the hex of the contact's advert packet. Returns the raw bytes and what is in it;
+    ValueError (with a readable message) when it is not one."""
+    t = ''.join(text.split())
+    if t.lower().startswith('meshcore://'):
+        t = t[len('meshcore://'):]
+    if not t or len(t) % 2 or not re.fullmatch(r'[0-9a-fA-F]+', t):
+        raise ValueError('that is not a meshcore:// contact link')
+    raw = bytes.fromhex(t)
+    if len(raw) < 2 or (raw[0] >> 2) & 0x0F != 4:
+        raise ValueError('the link is not a contact (advert) packet')
+    path = (raw[1] & 0x3F) * ((raw[1] >> 6) + 1)
+    pay = raw[2 + path:]
+    if len(pay) < 101:
+        raise ValueError('the link is too short')
+    flags, off = pay[100], 101
+    if flags & 0x10:
+        off += 8
+    if flags & 0x20:
+        off += 2
+    if flags & 0x40:
+        off += 2
+    name = pay[off:].decode(errors='replace').strip('\0 ') if flags & 0x80 else ''
+    return {'raw': raw, 'key': pay[:32].hex(), 'type': NODE_TYPES.get(flags & 0x0F, '?'), 'name': name or pay[:4].hex()}
+
+
 class CliError(Exception):
     def __init__(self, text: str, code: int = 1):
         super().__init__(text)
@@ -5062,6 +5156,25 @@ async def cmd_contacts(a) -> int:
         for _, n, c in rows:
             seen = datetime.fromtimestamp(c['last_advert']).strftime('%Y-%m-%d %H:%M') if c.get('last_advert') else 'never'
             print(f'{n:<24} {NODE_TYPES.get(c.get("type"), "?"):<9} {seen}  {cli_route(app, c)}')
+        return 0
+    finally:
+        await cli_finish(app)
+
+
+async def cmd_addcontact(a) -> int:
+    try:
+        info = parse_contact_link(a.link)
+    except ValueError as e:
+        raise CliError(str(e), 2)
+    app = await cli_app()
+    try:
+        if any(c['public_key'] == info['key'] for c in app.contacts().values()):
+            print(f'{info["name"]} is already a contact')
+            return 0
+        r = await app.mc.commands.import_contact(info['raw'])
+        if r.type == EventType.ERROR:
+            raise CliError(f'add failed: {describe_error(r.payload)}')
+        print(f'added {info["name"]} ({info["type"]}, key {info["key"][:8]})')
         return 0
     finally:
         await cli_finish(app)
@@ -5232,6 +5345,8 @@ def main():
     sp.add_argument('pattern', nargs='?', help='only names containing this')
     sp.add_argument('--json', action='store_true')
     sub.add_parser('channels', help='list the channels of the radio')
+    sp = sub.add_parser('addcontact', help='add a contact from a meshcore:// link (as shared by the Android app)')
+    sp.add_argument('link')
     sp = sub.add_parser('info', help='what the radio says about itself (name, key, frequency, battery)')
     sp.add_argument('--json', action='store_true')
     sp = sub.add_parser('advert', help='announce this node (zero hop; --flood for everyone)')
@@ -5275,7 +5390,7 @@ def main():
             sys.exit(f'{APP}: {e}')
         print('radio daemon: running' + (', and it stays running when no window is open' if _keep_daemon() else ''))
         sys.exit(0)
-    if command in ('send', 'read', 'contacts', 'channels', 'info', 'advert', 'listen'):
+    if command in ('send', 'read', 'contacts', 'channels', 'info', 'advert', 'listen', 'addcontact'):
         sys.exit(run_cli(globals()['cmd_' + command], opts))
     if command == 'check':
         sys.exit(check())
