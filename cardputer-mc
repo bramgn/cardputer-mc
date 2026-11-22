@@ -2182,11 +2182,16 @@ class MessagingMixin:
             scr.addstr(y0 + y, x0, blank(bw), theme_REV)
         scr.addnstr(y0, x0 + 1, self.details_title, bw - 2, theme_REV | curses.A_BOLD)
         verdicts = self.details_title.startswith(('Trace', 'Ping', 'Route'))
+        hmax = max(0, max((len(l) for l in self.details), default=0) - (bw - 2))
+        self.details_hscroll = min(self.details_hscroll, hmax)
+        hs = self.details_hscroll
         for i, line in enumerate(rows):
-            scr.addnstr(y0 + 1 + i, x0 + 1, line, bw - 2,
+            scr.addnstr(y0 + 1 + i, x0 + 1, line[hs:], bw - 2,
                         theme_result_attr(line, theme_REV) if verdicts else theme_REV)
+        horiz = hmax > 0
         scr.addnstr(y0 + bh - 1, x0 + 1,
-                    ('↑/↓ scroll · any other key closes' if more else 'press any key to close')
+                    (f'{"↑↓" if more else ""}{"←→" if horiz else ""} scroll · other key closes' if more or horiz
+                     else 'press any key to close')
                     + (' (back to the menu)' if self.details_back else ''), bw - 2,
                     theme_REV | curses.A_DIM)
         curses.curs_set(0)
@@ -3517,13 +3522,18 @@ class CommandsMixin:
         for y in range(bh):
             scr.addstr(y0 + y, x0, blank(bw), theme_REV)
         scr.addnstr(y0, x0 + 1, f'Help — {APP} {__version__}', bw - 2, theme_REV | curses.A_BOLD)
+        wide = max((len(f'{a:<24}{b}') for a, b in self.HELP), default=0)        # the longest line of the whole text
+        hmax = max(0, wide - (bw - 2))
+        self.help_hscroll = min(self.help_hscroll, hmax)
+        hs = self.help_hscroll
         for i, (a, b) in enumerate(rows):
             if a and not b:
-                scr.addnstr(y0 + 1 + i, x0 + 1, a, bw - 2, theme_REV | curses.A_UNDERLINE)
+                scr.addnstr(y0 + 1 + i, x0 + 1, a[hs:], bw - 2, theme_REV | curses.A_UNDERLINE)
             else:
-                scr.addnstr(y0 + 1 + i, x0 + 1, f'{a:<24}{b}', bw - 2, theme_REV)
-        scr.addnstr(y0 + bh - 1, x0 + 1, 'Up/Down scroll · any other key closes' if len(self.HELP) > room
-                    else 'press any key to close', bw - 2, theme_REV | curses.A_DIM)
+                scr.addnstr(y0 + 1 + i, x0 + 1, f'{a:<24}{b}'[hs:], bw - 2, theme_REV)
+        vert, horiz = len(self.HELP) > room, hmax > 0
+        scr.addnstr(y0 + bh - 1, x0 + 1, f'{"↑↓" if vert else ""}{"←→" if horiz else ""} scroll · other key closes'
+                    if vert or horiz else 'press any key to close', bw - 2, theme_REV | curses.A_DIM)
         curses.curs_set(0)
 
 
@@ -3589,6 +3599,10 @@ class UiMixin:
                                        curses.KEY_NPAGE: self.details_scroll + page,
                                        curses.KEY_HOME: 0, curses.KEY_END: 10 ** 6}[k]
                 return
+            if k in (curses.KEY_LEFT, curses.KEY_RIGHT):
+                self.details_hscroll = max(0, self.details_hscroll + (8 if k == curses.KEY_RIGHT else -8))
+                return
+            self.details_hscroll = 0
             self.details = None
             back, self.details_back = self.details_back, None
             if back == 'options':                        # one step back: Options, or the Actions menu the window came from
@@ -3609,8 +3623,13 @@ class UiMixin:
                 self.help_scroll = 0
             elif k == curses.KEY_END:
                 self.help_scroll = 10 ** 6
+            elif k == curses.KEY_LEFT:
+                self.help_hscroll = max(0, self.help_hscroll - 8)
+            elif k == curses.KEY_RIGHT:
+                self.help_hscroll += 8
             else:
                 self.help_open = False
+                self.help_hscroll = 0
             self.dirty = True
             return
         if self.ask:
@@ -4190,6 +4209,7 @@ class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMi
         self.details_title = 'Message details'
         self.details_scroll = 0
         self.scr_h = 24
+        self.help_hscroll = self.details_hscroll = 0     # sideways scroll of the Help / details windows (long lines)
         self.details_back: tuple | None = None   # (key, menu row) of the context menu to return to
         self.menu_origin: tuple | None = None    # set when a menu action may open a window
         self.menu_task: asyncio.Task | None = None
