@@ -935,6 +935,7 @@ theme_REV = curses.A_REVERSE                   # bars and popups
 theme_SEL = curses.A_REVERSE | curses.A_BOLD   # highlighted row
 theme_HEAD = curses.A_BOLD | curses.A_UNDERLINE
 theme_UNREAD = curses.A_BOLD
+theme_BG = curses.A_NORMAL                     # the background of the whole screen (a theme can paint its own)
 theme_FAV = curses.A_BOLD                     # favourite contacts in the list (yellow when there are colours)
 theme_ME = curses.A_DIM
 theme_NOTE = curses.A_DIM
@@ -976,8 +977,9 @@ theme_THEMES = {
               ('green', 'default'), ('cyan', 'default'), ('red', 'default')),
     'amber': (('black', 'yellow'), ('yellow', 'black'), ('yellow', 'default'), ('white', 'default'),
               ('yellow', 'default'), ('magenta', 'default'), ('red', 'default')),
-    'light': (('white', 'black'), ('white', 'blue'), ('blue', 'default'), ('default', 'default'),
-              ('green', 'default'), ('magenta', 'default'), ('red', 'default')),
+    # paints its own white background (see theme_BACKGROUND), so it is light on any terminal
+    'light': (('white', 'blue'), ('black', 'cyan'), ('blue', 'white'), ('red', 'white'),
+              ('blue', 'white'), ('magenta', 'white'), ('red', 'white')),
     # 256-colour themes (ints are xterm palette indexes; terminals with fewer colours get the nearest basic colour)
     'vampire':   ((253, 61), (234, 212), (141, 'default'), (228, 'default'), (84, 'default'), (117, 'default'), (203, 'default')),
     'fjord':     ((254, 60), (236, 110), (110, 'default'), (222, 'default'), (108, 'default'), (139, 'default'), (167, 'default')),
@@ -991,6 +993,10 @@ theme_THEMES = {
     'parchment': ((236, 223), (255, 130), (94, 'default'), ('default', 'default'), (64, 'default'), (125, 'default'), (124, 'default')),
     'mono': None,
 }
+
+
+theme_BACKGROUND = {'light': ('black', 'white')}      # themes that paint the whole screen: (text, background)
+theme_FAV_COLOR = {'light': 166}                      # a favourite is dark orange there (yellow would vanish on white)
 
 
 def theme_col(c) -> int:
@@ -1010,7 +1016,7 @@ def theme_col(c) -> int:
 
 theme_DESCRIPTIONS = {
     'blue': 'classic white-on-blue bars', 'green': 'green phosphor terminal', 'amber': 'amber CRT',
-    'light': 'for light terminals', 'mono': 'no colour, bold and reverse only',
+    'light': 'dark text on a white background', 'mono': 'no colour, bold and reverse only',
     'vampire': 'purple and pink on dark (Dracula-ish)', 'fjord': 'cold blues and soft frost (Nord-ish)',
     'sundial': 'teal and mustard (Solarized-ish)', 'harvest': 'warm retro earth tones (Gruvbox-ish)',
     'shibuya': 'rainy neon night (Tokyo Night-ish)', 'synthwave': 'magenta and cyan 80s grid',
@@ -1020,9 +1026,10 @@ theme_DESCRIPTIONS = {
 
 
 def theme_init_colors(theme: str = 'blue'):
-    global theme_FAV, theme_REV, theme_SEL, theme_HEAD, theme_UNREAD, theme_ME, theme_NOTE, theme_FAIL, theme_GOOD_BAR, theme_BAD_BAR
+    global theme_BG, theme_FAV, theme_REV, theme_SEL, theme_HEAD, theme_UNREAD, theme_ME, theme_NOTE, theme_FAIL, theme_GOOD_BAR, theme_BAD_BAR
     pairs = theme_THEMES.get(theme)
     if pairs is None or not curses.has_colors():
+        theme_BG = curses.A_NORMAL
         theme_REV, theme_SEL, theme_HEAD = curses.A_REVERSE, curses.A_REVERSE | curses.A_BOLD, curses.A_BOLD | curses.A_UNDERLINE
         theme_UNREAD, theme_ME, theme_NOTE, theme_FAIL = curses.A_BOLD, curses.A_DIM, curses.A_DIM, curses.A_BOLD
         theme_GOOD_BAR, theme_BAD_BAR = curses.A_BOLD, curses.A_BOLD | curses.A_UNDERLINE
@@ -1034,7 +1041,14 @@ def theme_init_colors(theme: str = 'blue'):
     # favourites: a clear yellow. The basic 'yellow' (colour 3) shows as orange on many terminals, so use the 256-colour 226
     # (or the bright yellow 11) when the terminal has them
     fav = 226 if curses.COLORS >= 256 else 11 if curses.COLORS >= 16 else theme_col('yellow')
-    curses.init_pair(10, fav, theme_col('default'))
+    if theme in theme_FAV_COLOR:
+        fav = theme_FAV_COLOR[theme] if curses.COLORS >= 256 else theme_col('magenta')
+    curses.init_pair(10, fav, theme_col(theme_BACKGROUND[theme][1]) if theme in theme_BACKGROUND else theme_col('default'))
+    if theme in theme_BACKGROUND:
+        curses.init_pair(11, theme_col(theme_BACKGROUND[theme][0]), theme_col(theme_BACKGROUND[theme][1]))
+        theme_BG = curses.color_pair(11)
+    else:
+        theme_BG = curses.A_NORMAL
     theme_FAV = curses.color_pair(10)
     theme_REV = curses.color_pair(1)
     theme_SEL = curses.color_pair(2) | curses.A_BOLD
@@ -3807,6 +3821,10 @@ class UiMixin:
     def draw(self, scr):
         h, w = scr.getmaxyx()
         self.scr_h = h
+        if getattr(self, '_bg', None) != theme_BG:     # a theme with its own background paints the whole screen
+            scr.bkgd(' ', theme_BG)
+            self._bg = theme_BG
+            self.repaint = True
         if self.repaint:
             scr.clear()
             self.repaint = False
