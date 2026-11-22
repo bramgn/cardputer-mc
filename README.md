@@ -85,6 +85,10 @@ commands. Edit `config.toml` and reconnect.
   sets the IRQ status, over the same SPI bus the receive loop uses. Packets could come out with the
   wrong length or bytes (and zero-length packets). The receive loop now waits for the handler to finish.
 
+- **ACKs with extra bytes.** Newer firmware appends two bytes after the 4-byte ack hash. Stock meshcore-pi
+  rejected those (`Ack packet payload is not 4 bytes`), so a message that did arrive was never shown as
+  delivered. Now the first four bytes are used.
+
 ## First contact
 
 The node can only decrypt messages from contacts whose advert it has received. After a fresh install

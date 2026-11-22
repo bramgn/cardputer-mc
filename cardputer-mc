@@ -215,6 +215,26 @@ index c1ef922..08e6683 100644
          if ackhash is not None:
              self.data += bytes([self.TYPE_ACK]) + ackhash
 '''
+PI_PATCH_ACK = r'''diff --git a/packet.py b/packet.py
+index 08e6683..505dd49 100644
+--- a/packet.py
++++ b/packet.py
+@@ -952,10 +952,10 @@ class MC_Ack(MC_Incoming):
+         """
+         Scan the packet for information.
+         """
+-        # Ack hashes are 4 bytes
+-        if len(self._payload) != 4:
+-            raise InvalidMeshcorePacket("Ack packet payload is not 4 bytes")
+-        self.ackhash = bytes(self._payload)
++        # Ack hashes are 4 bytes; newer MeshCore firmware appends extra bytes, which we ignore
++        if len(self._payload) < 4:
++            raise InvalidMeshcorePacket("Ack packet payload is less than 4 bytes")
++        self.ackhash = bytes(self._payload[:4])
+ 
+     def __str__(self):
+         return super().__str__() + f"Ackhash: {hexlify(self.ackhash).decode()}\n"
+'''
 APT_PACKAGES = ['git', 'python3-venv', 'python3-rpi-lgpio', 'python3-lgpio']
 PIP_PACKAGES = ['meshcore', 'pycryptodome', 'aiotools', 'pyserial_asyncio', 'typing-extensions', 'LoRaRF']
 
@@ -322,12 +342,13 @@ def install(argv):
         _run(['git', 'clone', '-q', PI_REPO, PI_DIR])
     _run(['git', '-C', PI_DIR, 'checkout', '-q', PI_COMMIT])
     # local fixes: MeshCore >= 1.11 multi-byte path hashes, and a receive race in the LoRa driver loop
-    if subprocess.run(['git', '-C', PI_DIR, 'apply', '--check', '-R', '-'], input=PI_PATCH, text=True,
-                      capture_output=True).returncode == 0:
-        print('  fixes already applied')
-    else:
-        subprocess.run(['git', '-C', PI_DIR, 'apply', '--whitespace=nowarn', '-'], input=PI_PATCH, text=True, check=True)
-        print('  applied fixes (multi-byte path hashes, RX race)')
+    for name, patch in (('multi-byte path hashes, RX race', PI_PATCH), ('ACKs with extra bytes', PI_PATCH_ACK)):
+        if subprocess.run(['git', '-C', PI_DIR, 'apply', '--check', '-R', '-'], input=patch, text=True,
+                          capture_output=True).returncode == 0:
+            print(f'  fix already applied: {name}')
+        else:
+            subprocess.run(['git', '-C', PI_DIR, 'apply', '--whitespace=nowarn', '-'], input=patch, text=True, check=True)
+            print(f'  applied fix: {name}')
 
     print('4/5 config')
     if os.path.exists(PI_CONFIG):
