@@ -4540,20 +4540,23 @@ def sound_device() -> list:
 
 
 def chime_file(kind: str) -> str:
-    """A short wav for a private message (two rising tones) or a channel message (one low tone); made on first use."""
+    """A wav for a private message (two rising tones) or a channel message (one low tone); made on first use.
+    The codec needs a moment to wake up, so the file starts with silence (without it a short beep is swallowed)."""
     import wave, struct
-    path = os.path.join(SOUND_DIR, f'{kind}.wav')
+    path = os.path.join(SOUND_DIR, f'{kind}-2.wav')
     if not os.path.exists(path):
         os.makedirs(SOUND_DIR, exist_ok=True)
-        rate, out = 16000, []
-        for freq, dur in (((880, 0.09), (1319, 0.14)) if kind == 'private' else ((587, 0.12),)):
+        rate = 48000
+        out = [0] * int(rate * 0.4)
+        for freq, dur in (((880, 0.15), (1319, 0.25)) if kind == 'private' else ((587, 0.25),)):
             n = int(rate * dur)
-            out += [int(9000 * min(1, i / 200, (n - i) / 400) * math.sin(2 * math.pi * freq * i / rate)) for i in range(n)]
+            out += [int(26000 * min(1, i / 400, (n - i) / 2000) * math.sin(2 * math.pi * freq * i / rate)) for i in range(n)]
+        out += [0] * int(rate * 0.1)
         with wave.open(path, 'wb') as w:
-            w.setnchannels(1)
+            w.setnchannels(2)
             w.setsampwidth(2)
             w.setframerate(rate)
-            w.writeframes(b''.join(struct.pack('<h', v) for v in out))
+            w.writeframes(b''.join(struct.pack('<hh', v, v) for v in out))
     return path
 
 
