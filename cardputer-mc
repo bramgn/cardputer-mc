@@ -1196,6 +1196,7 @@ class ConnectionMixin:
             if mc.self_info is None:
                 raise RuntimeError('no response from radio')
             self.mc = mc
+            mc.set_decrypt_channel_logs(True)    # RX log entries for channel packets then carry the message
             # announce protocol v3: the radio then reports SNR with each received message
             r = await mc.commands.send_device_query()
             log.info('device query: %s', 'ok' if r.type != EventType.ERROR else describe_error(r.payload))
@@ -1452,6 +1453,9 @@ class MessagingMixin:
         if r.type in (EventType.MSG_SENT, EventType.OK):      # channel sends are answered with a plain OK
             msg.status = 'sent'
             msg.info = dict(r.payload)
+            if key[0] == 'c':
+                name = (self.mc.self_info or {}).get('name', '')
+                self.pending_repeats[(msg.ts, f'{name}: {msg.text}')] = (msg, time.time())
             if key[0] == 'd':
                 self.expect_ack(msg, r.payload)
                 if self.retries:
@@ -1574,6 +1578,8 @@ class MessagingMixin:
                 rows.append(('Node type', NODE_TYPES.get(c.get('type'), '?')))
         if m.mine:
             rows.append(('Sent', fmt(m.ts)))
+            if m.info.get('heard'):
+                rows.append(('Repeats heard', f'{len(m.info["heard"])}  (' + ', '.join(m.info['heard']) + ')'))
             rows.append(('Status', {'sent': 'sent to radio (no ack yet)',
                                     'acked': 'delivered (ack received)',
                                     'failed': 'failed (press r in the message list to resend)'}.get(m.status, m.status or '-')))
@@ -1710,6 +1716,24 @@ class MessagingMixin:
             out += [' ' * 16 + l for l in lines[1:]]
         self.show('Packet', out)
 
+    def count_repeat(self, p: dict):
+        """A channel packet that matches one of our recent sends is a repeater re-broadcasting it."""
+        now = time.time()
+        for k in [k for k, (_, t) in self.pending_repeats.items() if now - t > 300]:
+            del self.pending_repeats[k]
+        hit = self.pending_repeats.get((p.get('sender_timestamp'), p.get('message')))
+        if hit is None:
+            return
+        heard = hit[0].info.setdefault('heard', [])
+        route = ' > '.join(self.path_hops(p)) or 'direct'
+        if route not in heard:                # the same path twice is one repeater heard twice
+            heard.append(route)
+            self.dirty = True
+
+    def path_hops(self, p: dict) -> list[str]:
+        path, step = p.get('path') or '', 2 * (p.get('path_hash_size') or 1)
+        return [self.hop_name(path[i:i + step]) for i in range(0, len(path), step)]
+
     def on_rx_log(self, event):
         p = event.payload
         ptype = p.get('payload_typename', '?')
@@ -1719,7 +1743,7 @@ class MessagingMixin:
             hops = [f'{(int(path[i:i + 2], 16) - (256 if int(path[i:i + 2], 16) > 127 else 0)) / 4:.2f}dB'
                     for i in range(0, len(path), 2)]
         elif ptype != 'ACK':
-            hops = [self.hop_name(path[i:i + 2]) for i in range(0, len(path), 2)]
+            hops = self.path_hops(p)
         extra = ''
         if ptype == 'ADVERT' and p.get('adv_key'):
             self.signal[p['adv_key'][:12]] = (int(datetime.now().timestamp()), p.get('snr'),
@@ -1732,6 +1756,8 @@ class MessagingMixin:
             extra = f'  ack {path}'
         if hops:
             extra += '  path ' + ' > '.join(hops)
+        if ptype == 'GRP_TXT' and p.get('message') is not None:
+            self.count_repeat(p)
         now = int(datetime.now().timestamp())
         self.add(RX_KEY, Msg(now, '', f'{ptype:<9} rssi {p.get("rssi", "?"):>4} '
                              f'snr {p.get("snr", "?"):>5}{extra}', recv=now, info=dict(p)), unread=False)
@@ -1740,6 +1766,9 @@ class MessagingMixin:
         lines = []
         for n, m in enumerate(self.history.get(self.selected, [])):
             mark = {'sent': ' ·', 'acked': ' ✓', 'failed': ' ✗'}.get(m.status, '')
+            heard = len(m.info.get('heard', ())) if m.mine else 0
+            if heard:
+                mark = f' · heard {heard} repeat{"s" if heard != 1 else ""}'
             body = f'{m.who}: {m.text}' if m.who else m.text
             prefix = f'{hhmm(m.ts)} '
             attr = (theme_NOTE if m.who == '*' else theme_FAIL if m.status == 'failed'
@@ -3160,6 +3189,7 @@ class App(ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMixin, Channel
         self.set_sel = 0
         self.focus = 'side'                  # 'side' (list) | 'input' | 'msgs'
         self.chan_secrets: dict[int, str] = {}   # slot -> secret hex, from the last channel load
+        self.pending_repeats: dict[tuple, tuple] = {}   # (timestamp, 'name: text') -> (Msg, sent at) of recent channel sends
         self.search: dict | None = None      # /search results overlay
         self.msg_sel = 0
         self.last_body_h = 0
