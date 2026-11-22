@@ -2989,6 +2989,15 @@ class UiMixin:
         self.dirty = True
         return True
 
+    def message_on_row_of_list(self) -> int:
+        """The message drawn on the screen row where the list's cursor is; the last message when there is none."""
+        last = len(self.history.get(self.selected, ())) - 1
+        item, row = self.side_row
+        shown_item, rows = self.msg_rows
+        if item != self.selected or shown_item != self.selected:     # not drawn yet since the selection changed
+            return last
+        return min(rows.get(row, last), last)
+
     def can_chat(self) -> bool:
         """True when the selected item takes typed messages: a channel or a chat contact."""
         key = self.selected
@@ -3017,7 +3026,7 @@ class UiMixin:
         elif k in ('\t', curses.KEY_RIGHT):  # to the messages, if there are any, else on to the function keys
             if self.history.get(self.selected):
                 self.focus = 'msgs'
-                self.msg_sel = len(self.history[self.selected]) - 1
+                self.msg_sel = self.message_on_row_of_list()
             elif k == '\t':
                 self.focus = 'fkeys'
         elif k in (curses.KEY_LEFT, '\x1b'):
@@ -3082,6 +3091,8 @@ class UiMixin:
             attr = theme_SEL if key == self.selected else (
                 theme_UNREAD if u else curses.A_NORMAL)
             scr.addnstr(1 + y, 0, text, sw - 1, attr)
+            if key == self.selected:
+                self.side_row = (key, 1 + y)
         for y in range(1, h - 2):
             scr.addstr(y, sw, '│')
 
@@ -3116,7 +3127,9 @@ class UiMixin:
                     self.scroll = max(0, len(lines) - idx[0] - body_h)
         self.scroll = min(self.scroll, max(0, len(lines) - body_h))
         end = len(lines) - self.scroll
+        self.msg_rows = (self.selected, {})
         for y, (text, attr, n) in enumerate(lines[max(0, end - body_h):end]):
+            self.msg_rows[1][1 + y] = n
             if self.focus == 'msgs' and n == self.msg_sel:
                 attr = theme_SEL
             scr.addnstr(1 + y, sw + 1, text, mw, attr)
@@ -3272,6 +3285,8 @@ class App(ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMixin, Channel
         self.set_sel = 0
         self.focus = 'side'                  # 'side' (list) | 'input' | 'msgs' | 'fkeys' (function key bar)
         self.fsel = 0                        # highlighted entry of the function key bar
+        self.side_row: tuple = (None, 0)     # (item, screen row) of the selected list entry, as last drawn
+        self.msg_rows: tuple = (None, {})    # (item, {screen row: message index}) of the messages, as last drawn
         self.chan_secrets: dict[int, str] = {}   # slot -> secret hex, from the last channel load
         self.pending_repeats: dict[tuple, tuple] = {}   # (timestamp, 'name: text') -> (Msg, sent at) of recent channel sends
         self.search: dict | None = None      # /search results overlay

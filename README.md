@@ -72,6 +72,9 @@ are usable without reaching for the tiny Fn row. Typing in the list, the message
 The arrow keys sit on the CardputerZero's Fn layer, so whenever you are not typing (not in the prompt, a question
 or a setting being edited) `z` `c` `f` `x` act as left, right, up and down, in the lists, menus and windows.
 
+Going from the list to the messages (Right, `c` or Tab) puts the cursor on the message that is on the same
+screen row as the list's cursor, or on the last message when that row is empty.
+
 The list on the left takes a quarter of the width (10 to 24 columns): a wide terminal keeps the full list, the
 built-in 45-column screen gives the messages 33 columns instead of 20.
 
