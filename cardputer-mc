@@ -1609,7 +1609,11 @@ class MessagingMixin:
         msgs = self.history.get(self.selected, [])
         page = max(1, self.last_body_h // 2)
         if k == '\t':
+            self.focus = 'fkeys'
+        elif k == curses.KEY_LEFT:
             self.focus = 'side'
+        elif k == curses.KEY_RIGHT:
+            pass
         elif k == '\x1b':
             self.focus = 'input'
         elif k == curses.KEY_UP:
@@ -2711,8 +2715,9 @@ class CommandsMixin:
         ('Up / Down', 'move through the list on the left'),
         ('PgUp / PgDn', 'scroll history'),
         ('Enter', 'in the list: context menu; in the input: send'),
-        ('Tab', 'list > input > messages > list (messages: Up/Down, Enter = details, r = resend)'),
-        ('Esc', 'back one step: messages > input > list'),
+        ('Tab', 'list > input > messages > function keys > list (messages: Up/Down, Enter = details, r = resend)'),
+        ('Left / Right', 'list <-> messages; on the function keys: pick one, Enter presses it'),
+        ('Esc', 'back one step: function keys / messages > input > list'),
         ('F1', 'this help'),
         ('F2', 'options (name, TX power, advert, theme, ...)'),
         ('F3', 'choose device and connect / disconnect'),
@@ -2863,6 +2868,8 @@ class UiMixin:
         if self.settings_open:
             await self.handle_settings_key(k)
             return
+        if self.focus == 'fkeys' and await self.handle_fkeys_key(k):
+            return
         if self.focus == 'side' and self.handle_side_key(k):
             return
         if self.focus == 'msgs' and self.handle_msg_focus_key(k):
@@ -2943,6 +2950,29 @@ class UiMixin:
             await self.toggle_connection()
         self.dirty = True
 
+    FKEYS = ('F1', 'F2', 'F3', 'F7', 'F8', 'F9', 'F10')
+
+    async def handle_fkeys_key(self, k) -> bool:
+        """Keys while the function key bar has focus: Left/Right pick one, Enter presses it."""
+        n = len(self.FKEYS)
+        if k == curses.KEY_LEFT:
+            self.fsel = (self.fsel - 1) % n
+        elif k == curses.KEY_RIGHT:
+            self.fsel = (self.fsel + 1) % n
+        elif k == '\t':
+            self.focus = 'side'
+        elif k in ('\x1b', curses.KEY_UP):
+            self.focus = 'input'
+        elif k == '\n':
+            await self.handle_key(getattr(curses, 'KEY_' + self.FKEYS[self.fsel]))
+        elif isinstance(k, str) and not (len(k) == 1 and ord(k) in (CTRL_Q, CTRL_C)):
+            self.focus = 'input'              # typing starts a message
+            return False
+        else:
+            return False
+        self.dirty = True
+        return True
+
     def handle_side_key(self, k) -> bool:
         """Keys while the list on the left has focus; returns False to fall through to the input."""
         if k in (curses.KEY_UP, '\x10'):
@@ -2957,6 +2987,14 @@ class UiMixin:
             self.open_contact_menu()
         elif k == '\t':
             self.focus = 'input'
+        elif k == curses.KEY_RIGHT:           # like Tab from the input: to the messages, if there are any
+            if self.history.get(self.selected):
+                self.focus = 'msgs'
+                self.msg_sel = len(self.history[self.selected]) - 1
+            else:
+                self.focus = 'input'
+        elif k == curses.KEY_LEFT:
+            pass
         elif k == '\x1b':
             pass
         elif isinstance(k, str) and not (len(k) == 1 and ord(k) in (CTRL_Q, CTRL_C)):
@@ -3069,8 +3107,19 @@ class UiMixin:
         keys = [('F1', 'Help'), ('F2', 'Options'),
                 ('F3', 'Disconnect' if self.mc else 'Connect'),
                 ('F7', 'Menu'), ('F8', 'Log'), ('F9', 'RX log'), ('F10', 'Quit')]
-        status = ' ' + '  '.join(f'{k} {v}' for k, v in keys)
-        scr.addnstr(h - 1, 0, status.ljust(w), w - 1, theme_REV)
+        scr.addnstr(h - 1, 0, ''.ljust(w), w - 1, theme_REV)
+        first = 0
+        if self.focus == 'fkeys':             # on a narrow screen drop the leading keys until the chosen one fits
+            while first < self.fsel and 1 + sum(len(f'{k} {v}') + 2 for k, v in keys[first:self.fsel + 1]) > w - 1:
+                first += 1
+        x = 1
+        for i, (k, v) in enumerate(keys[first:], first):
+            chosen = self.focus == 'fkeys' and i == self.fsel
+            scr.addnstr(h - 1, x, f'{k} {v}', max(0, w - 1 - x),
+                        ((theme_REV ^ curses.A_REVERSE) | curses.A_BOLD) if chosen else theme_REV)
+            x += len(f'{k} {v}') + 2
+            if x >= w - 1:
+                break
         scr.move(h - 2, min(w - 1, len(prompt) + self.pos - start))
         curses.curs_set(1 if self.focus == 'input' else 0)
         if self.settings_open:
@@ -3186,7 +3235,8 @@ class App(ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMixin, Channel
         self.quit = False
         self.settings_open = False
         self.set_sel = 0
-        self.focus = 'side'                  # 'side' (list) | 'input' | 'msgs'
+        self.focus = 'side'                  # 'side' (list) | 'input' | 'msgs' | 'fkeys' (function key bar)
+        self.fsel = 0                        # highlighted entry of the function key bar
         self.chan_secrets: dict[int, str] = {}   # slot -> secret hex, from the last channel load
         self.pending_repeats: dict[tuple, tuple] = {}   # (timestamp, 'name: text') -> (Msg, sent at) of recent channel sends
         self.search: dict | None = None      # /search results overlay
