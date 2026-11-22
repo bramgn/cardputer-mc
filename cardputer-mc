@@ -448,12 +448,161 @@ def uninstall(argv):
     return 0
 
 
+def check() -> int:
+    """Wiring test for this board's SX1262, without airtime: RESET/BUSY handshake, an SPI read, the I2C expander
+    and DIO1. Uses the pins from config.toml (the CardputerZero's own mapping when there is none)."""
+    import glob
+    import tomllib
+    results = []
+
+    def report(ok, text):
+        print(f'[{ {True: " ok ", False: "FAIL", None: "info"}[ok] }] {text}', flush=True)
+        results.append(ok)
+
+    try:
+        with open(PI_CONFIG, 'rb') as f:
+            cfg = tomllib.load(f)
+        icfg = cfg['interface'][(cfg.get('interfaces') or ['caplora'])[0]]
+    except (OSError, KeyError, ValueError, tomllib.TOMLDecodeError):
+        icfg = {}
+        report(None, f'no usable {PI_CONFIG}; using the CardputerZero mapping')
+    spi, cs = icfg.get('spi', 0), icfg.get('cs', 1)
+    reset, busy, irq = icfg.get('reset', 26), icfg.get('busy', 22), icfg.get('irq', 23)
+    report(None, f'pins: RESET GPIO{reset}, BUSY GPIO{busy}, DIO1 GPIO{irq}, SPI{spi} CS{cs}')
+
+    pids = _running_pids()
+    if pids:
+        report(False, f'{APP} or meshcore-pi is running (pid {", ".join(map(str, pids))}); quit it first')
+        return 1
+    dev = f'/dev/spidev{spi}.{cs}'
+    if not os.path.exists(dev):
+        report(False, f'{dev} does not exist (is SPI enabled?)')
+        return 1
+    report(True, f'{dev} exists')
+    try:
+        import RPi.GPIO as GPIO
+        import spidev
+    except ImportError as e:
+        report(False, f'missing Python module ({e}); run: {APP} install')
+        return 1
+
+    try:
+        with open(LED_5V) as f:
+            old_5v = f.read().strip()
+    except OSError:
+        old_5v = None
+    GPIO.setwarnings(False)
+    GPIO.setmode(GPIO.BCM)
+    spidev_dev = None
+    try:
+        _set_5v(True)
+        time.sleep(0.5)
+        report(None if old_5v is not None else False,
+               '5V supply of the module switched on' if old_5v is not None else f'no {LED_5V}: cannot switch the 5V supply')
+        try:
+            GPIO.setup(reset, GPIO.OUT, initial=GPIO.HIGH)
+            GPIO.setup(busy, GPIO.IN)
+        except Exception as e:
+            report(False, f'GPIO{reset}/GPIO{busy} cannot be claimed ({e}); something else uses them')
+            return 1
+
+        # 1. RESET / BUSY: BUSY is high while the chip is in reset and drops once it has started
+        def wait_busy_low(limit=1.0):
+            t = time.perf_counter()
+            while GPIO.input(busy):
+                if time.perf_counter() - t > limit:
+                    return None
+                time.sleep(0.0005)
+            return (time.perf_counter() - t) * 1000
+
+        GPIO.output(reset, GPIO.LOW)
+        time.sleep(0.05)
+        in_reset = GPIO.input(busy)
+        GPIO.output(reset, GPIO.HIGH)
+        time.sleep(0.001)
+        settle = wait_busy_low()
+        if in_reset and settle is not None:
+            report(True, f'BUSY (GPIO{busy}) follows RESET (GPIO{reset}): high in reset, low again {settle + 1:.0f} ms after release')
+        elif not in_reset:
+            report(False, f'BUSY (GPIO{busy}) did not go high while RESET (GPIO{reset}) was held: wrong pins, or no SX1262')
+        else:
+            report(False, f'BUSY (GPIO{busy}) stays high after RESET: chip not starting (no power, or wrong pin)')
+
+        # 2. the chip over SPI: GetStatus and the LoRa sync word register (reset default 0x1424)
+        try:
+            spidev_dev = spidev.SpiDev()
+            spidev_dev.open(spi, cs)
+            spidev_dev.max_speed_hz = 1000000
+            spidev_dev.mode = 0
+            if wait_busy_low() is None:
+                raise RuntimeError('BUSY never went low')
+            status = spidev_dev.xfer2([0xC0, 0x00])[1]
+            mode = (status >> 4) & 7
+            modes = {2: 'STDBY_RC', 3: 'STDBY_XOSC', 4: 'FS', 5: 'RX', 6: 'TX'}
+            report(mode in (2, 3), f'SX1262 answers on SPI{spi}.{cs}: status 0x{status:02X}, chip mode {modes.get(mode, mode)}')
+            wait_busy_low()
+            sync = spidev_dev.xfer2([0x1D, 0x07, 0x40, 0x00, 0x00, 0x00])[4:6]
+            report(sync == [0x14, 0x24], f'sync word register 0x0740 reads 0x{sync[0]:02X}{sync[1]:02X} (reset default 0x1424)')
+        except Exception as e:
+            report(False, f'SPI to the SX1262 failed: {e}')
+
+        # 3. the I2C expander (PI4IOE5V6408, address 0x43): read only
+        import fcntl
+        found = None
+        for bus in sorted(glob.glob('/dev/i2c-*')):
+            try:
+                fd = os.open(bus, os.O_RDWR)
+            except OSError:
+                continue
+            try:
+                fcntl.ioctl(fd, 0x0703, 0x43)                     # I2C_SLAVE
+                regs = {}
+                for reg in (0x01, 0x03, 0x05, 0x0F):
+                    os.write(fd, bytes([reg]))
+                    regs[reg] = os.read(fd, 1)[0]
+                if regs[0x01] >> 5 == 5:                         # manufacturer id of the PI4IOE5V6408
+                    found = (bus, regs)
+                    break
+            except OSError:
+                pass
+            finally:
+                os.close(fd)
+        if found:
+            bus, regs = found
+            mode = 'output' if regs[0x03] & 1 else 'input'
+            report(True, f'IO expander PI4IOE5V6408 found at 0x43 on {bus}; P0 is an {mode}, reads {"high" if regs[0x0F] & 1 else "low"}')
+        else:
+            report(False, 'no IO expander at 0x43 on any I2C bus (is the Cap fitted and the 5V supply on?)')
+
+        # 4. DIO1 must be free for meshcore-pi to claim
+        try:
+            GPIO.setup(irq, GPIO.IN)
+            report(True, f'DIO1 (GPIO{irq}) can be claimed; reads {"high" if GPIO.input(irq) else "low"} while idle')
+        except Exception as e:
+            report(False, f'DIO1 (GPIO{irq}) cannot be claimed ({e}); the kernel or another program uses it')
+    finally:
+        if spidev_dev is not None:
+            spidev_dev.close()
+        GPIO.cleanup()
+        if old_5v is not None:
+            try:
+                with open(LED_5V, 'w') as f:
+                    f.write(old_5v)
+            except OSError:
+                pass
+
+    bad = results.count(False)
+    print('\nAll checks passed: the wiring matches this configuration.' if not bad
+          else f'\n{bad} check(s) failed: this board may not match the pins in {PI_CONFIG}.')
+    return 1 if bad else 0
+
+
 def _bootstrap():
     if sys.argv[1:2] in (['--version'], ['-V']):
         print(f'{APP} {__version__}')
         sys.exit(0)
     if sys.argv[1:2] in (['-h'], ['--help']):
-        print(f'usage: {APP}\n       {APP} install [--name NAME] [--key HEX] [-y]\n       {APP} uninstall [--keep-identity] [--purge] [-y]\n       {APP} --version\n')
+        print(f'usage: {APP}\n       {APP} check\n       {APP} install [--name NAME] [--key HEX] [-y]\n       {APP} uninstall [--keep-identity] [--purge] [-y]\n       {APP} --version\n')
         print(__doc__.split('State lives')[0].strip())
         sys.exit(0)
     if sys.argv[1:2] == ['install']:
@@ -3670,7 +3819,10 @@ def main():
         prog=APP, description='ncurses MeshCore chat for the M5 CardputerZero with the Cap-LoRa-1262',
         epilog=f'First run: {APP} install   (sets up meshcore-pi, a venv and {PI_CONFIG})')
     ap.add_argument('--version', action='version', version=f'{APP} {__version__}')
-    ap.parse_args()
+    ap.add_argument('command', nargs='?', choices=['check'],
+                    help='check: test the SX1262 wiring (no airtime) and exit; without it the chat starts')
+    if ap.parse_args().command == 'check':
+        sys.exit(check())
     args = argparse.Namespace()
     locale.setlocale(locale.LC_ALL, '')
     os.environ.setdefault('ESCDELAY', '25')   # ncurses waits 1000ms after Esc by default

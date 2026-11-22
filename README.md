@@ -156,6 +156,17 @@ Back up `config.toml`: it holds the node's private key.
 - meshcore-pi is a third-party project; its receive loop keeps one CPU core busy while the radio is on.
 - Tested on a real CardputerZero: install, start, connect to the radio, quit and cleanup (5V off, no stray process), in an 80x24 terminal over SSH. Not checked: the 320x170 built-in display, sending and receiving chat messages from inside the UI.
 
+## Check the wiring
+
+```bash
+cardputer-mc check
+```
+
+Tests this board's SX1262 wiring in a few seconds, without sending anything: it switches the module's 5V supply on
+(and restores it), pulses RESET and checks that BUSY follows, reads the chip's status and the sync-word register over
+SPI, finds the I2C expander at 0x43 (read only) and checks that DIO1 is free. It uses the pins from `config.toml` and
+exits with 0 when everything matches. Run it on a new board or revision, with the app closed.
+
 ## Before you use it
 
 - The SX1262 pin mapping is **RESET GPIO26, BUSY GPIO22, DIO1/IRQ GPIO23, NSS = SPI0 CE1 (GPIO7, `/dev/spidev0.1`)**.
