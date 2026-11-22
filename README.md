@@ -55,7 +55,7 @@ from `config.toml` first and pass it to `install --key`.
 ## Use
 
 ```bash
-cardputer-mc            # connects to the local radio on start; F1 shows the keys
+cardputer-mc            # connects to the local radio on start; F4 (or F1) shows the keys
 cardputer-mc --version
 ```
 
@@ -64,15 +64,18 @@ heard being repeated by at least one repeater (channel message), ` ✗` failed. 
 Enter to see the details, including how many repeats were heard and through which repeaters.
 
 Keys: the arrow keys always navigate; the `>` prompt only becomes active when you press Enter on a channel or
-chat contact (Enter on a repeater, room, Log or Radio opens its menu instead, F7 opens the menu from anywhere).
-Esc goes back to the list. Tab goes list > messages > function-key bar > list. Left/Right switch between the
+chat contact (Enter on a repeater, room, Log or Radio opens its menu instead, F6 opens Actions for the selected item from anywhere).
+Esc goes back one step, to where you came from (input, messages or key bar to the list). Tab goes list > messages
+> each key of the function-key bar in turn > list. The headings in the list (Channels, Contacts, Repeaters,
+Console) take the cursor too: Enter (or Left/Right) folds and unfolds them, so 350 contacts can be put away; a
+folded heading still shows the unread count, and the choice is remembered. Left/Right switch between the
 list and the messages; on the function-key bar they pick a key (highlighted) and Enter presses it, so the F-keys
 are usable without reaching for the tiny Fn row. Typing in the list, the messages or the key bar does nothing.
 
 The arrow keys sit on the CardputerZero's Fn layer, so whenever you are not typing (not in the prompt, a question
 or a setting being edited) `z` `c` `f` `x` act as left, right, up and down, in the lists, menus and windows.
 
-Quitting: `Ctrl-C`, `Alt-X`, `Alt-Q` and `F10` ask `Quit? [y/n]` first (the same key again, `y` or Enter says yes, `n`
+Quitting: `Ctrl-C`, `Alt-X`, `Alt-Q` and `F8` ask `Quit? [y/n]` first (the same key again, `y` or Enter says yes, `n`
 or Esc cancels), also while a window is open; `Ctrl-Q` and `/q` quit at once. Alt is read as ESC followed by the
 key, which is what terminals send; in the Cardputer's own CLI app `cat -v` should show `^[x` for Alt-X.
 
@@ -92,9 +95,10 @@ message; `::` at the start sends a literal `:`. Tab completes `:` commands too.
 
 On a small screen (under about 60 columns) the title bar shows just the conversation, the battery of the
 CardputerZero itself (`58%+`, the plus means charging) and the connection state; messages drop their `HH:MM`
-prefix (Enter shows the time in the details); and the function-key bar uses short names (`Help Opts Conn Menu
-Log RX Quit`, reachable with Tab and Enter) instead of `F1 Help  F2 Options ...`. On a wide terminal nothing
-changes.
+prefix (Enter shows the time in the details); and the function-key bar is five slots,
+each centred above the keyboard key that presses it (`Fn`+4 to 8, the five keys that sit fully under the
+screen: Help, Options, Actions, Log, Quit; Tab and Enter work too). A wide terminal shows the key names
+(`F4 Help`). `F1`/`F2`/`F10` still work as before, `F3` connects or disconnects, `F9` shows the radio log.
 
 The list on the left takes a quarter of the width (10 to 24 columns): a wide terminal keeps the full list, the
 built-in 45-column screen gives the messages 33 columns instead of 20.
@@ -116,6 +120,45 @@ a few seconds; `/clear` clears it everywhere). `mcorectl --tcp 127.0.0.1:5001` c
   `check` and `uninstall` need the radio to themselves, so stop it first.
 - Not shared between windows: the cursor, the unread counts, the Log and Radio lists, and the UI settings file
   (the last window to change a setting wins).
+
+## From the command line
+
+The same radio daemon serves commands without a screen, so scripts (and other programs) can use the radio:
+
+```
+cardputer-mc send Yoshi "on my way"     # waits for the acknowledgement: exit 0 delivered, 1 not, 2 bad target
+cardputer-mc send '#test' hello all     # channel (no acknowledgement exists; exit 0 once the radio took it)
+echo "from a script" | cardputer-mc send Yoshi -
+cardputer-mc read Yoshi -n 5            # the stored conversation (--json, --dates); no target: overview
+cardputer-mc listen                     # print incoming messages as they arrive (--count N, --seconds N)
+cardputer-mc contacts [part-of-name]    # --json
+cardputer-mc channels
+cardputer-mc info                       # name, key, frequency, battery (--json)
+cardputer-mc advert [--flood]
+cardputer-mc up                         # start the daemon and exit
+```
+
+A target is a contact or channel name: exact, else the start, else any part of it (`#name` = channel).
+Everything lands in the shared history, so a running chat window shows messages sent from the command line
+(with the delivery mark) and `listen`/`read` also collect what arrived while no window was open.
+Repeaters are not a target for `send`: they take commands, which stay in the chat (Enter on the repeater).
+
+## Using the radio from another computer
+
+On a PC, install only the client part and point it at the Cardputer:
+
+```
+./cardputer-mc install --client                 # a venv with the meshcore library, and the command
+cardputer-mc --remote bram@cardputer            # the chat, with the Cardputer's radio
+cardputer-mc --remote bram@cardputer send Yoshi hi    # every command above works too
+```
+
+`--remote` (or `CARDPUTER_MC_REMOTE=user@host`) logs in over ssh (key based, no password prompt), starts the radio
+daemon there with `cardputer-mc up` if needed, and forwards its port to the PC for as long as the command runs. The
+daemon has no password of its own and only listens on the Cardputer's localhost: do not make it listen on the network,
+let the ssh login be the protection. The Cardputer needs `cardputer-mc` installed and `~/.local/bin/cardputer-mc`
+in place. The PC keeps its own chat history (it is not shared with the Cardputer's windows), and the title bar
+shows no battery (the PC's battery says nothing about the radio's).
 
 ## Staying connected
 

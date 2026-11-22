@@ -20,6 +20,7 @@ Chat history and UI settings live in ~/.config/cardputer-mc.
 
 import argparse
 import asyncio
+import atexit
 import curses
 import locale
 import os
@@ -301,12 +302,37 @@ def _migrate_old_name():
         print(f'  removed old command {old_link}')
 
 
+def install_client():
+    os.makedirs(HOME_DIR, exist_ok=True)
+    print('1/2 python venv (client only: meshcore library)')
+    if not os.path.isfile(VENV_PY):
+        _run([sys.executable, '-m', 'venv', VENV_DIR])
+    _run([VENV_PY, '-m', 'pip', 'install', '--retries', '10', '--timeout', '60', '-q', 'meshcore'])
+    print('2/2 command')
+    link_dir = os.path.expanduser('~/.local/bin')
+    os.makedirs(link_dir, exist_ok=True)
+    link = os.path.join(link_dir, APP)
+    target = os.path.realpath(__file__)
+    if os.path.realpath(link) != target:
+        if os.path.lexists(link):
+            os.remove(link)
+        os.symlink(target, link)
+    print(f'  {link} -> {target}')
+    print(f'\nDone. Run: {APP} --remote USER@HOST   (the radio machine needs {APP} installed; ssh must log in without a password)')
+    return 0
+
+
 def install(argv):
     ap = argparse.ArgumentParser(prog=f'{APP} install', description='Set up meshcore-pi, a venv and a config.')
     ap.add_argument('--name', default='Cardputer', help='node name shown to others (default: Cardputer)')
     ap.add_argument('--key', metavar='HEX', help='existing 32-byte private key (64 hex characters) instead of a new one')
     ap.add_argument('-y', '--yes', action='store_true', help='do not ask before running sudo apt-get')
+    ap.add_argument('--client', action='store_true',
+                    help='on a machine without the radio (a PC): only a venv with the meshcore library and the command, '
+                         f'for use with: {APP} --remote USER@HOST')
     opts = ap.parse_args(argv)
+    if opts.client:
+        return install_client()
     if opts.key and not re.fullmatch(r'[0-9a-fA-F]{64}', opts.key):
         raise SystemExit('--key must be 64 hex characters')
     _migrate_old_name()
@@ -602,7 +628,9 @@ def _bootstrap():
         print(f'{APP} {__version__}')
         sys.exit(0)
     if sys.argv[1:2] in (['-h'], ['--help']):
-        print(f'usage: {APP}\n       {APP} check | stop | status\n       {APP} install [--name NAME] [--key HEX] [-y]\n       {APP} uninstall [--keep-identity] [--purge] [-y]\n       {APP} --version\n')
+        print(f'usage: {APP} [--remote [USER@]HOST]\n       {APP} [--remote HOST] send TARGET TEXT... | read [TARGET] | contacts | channels | info | advert | listen\n'
+              f'       {APP} check | up | stop | status\n       {APP} install [--client] [--name NAME] [--key HEX] [-y]\n'
+              f'       {APP} uninstall [--keep-identity] [--purge] [-y]\n       {APP} --version   ({APP} COMMAND --help for details)\n')
         print(__doc__.split('State lives')[0].strip())
         sys.exit(0)
     if sys.argv[1:2] == ['install']:
@@ -916,11 +944,36 @@ def _tail(path: str, start: int, lines: int = 3) -> str:
     return ' | '.join(text.strip().splitlines()[-lines:])
 
 
+
+NBSP = '\u00a0'
+
+
+def blank(n: int) -> str:
+    """Highlighted filler for popups. Plain spaces in reverse video get wiped by ncurses with an erase
+    sequence, which on terminals with back-color-erase (st) paints the background instead of the highlight."""
+    return NBSP * n
+
+
+def pad(s: str, n: int) -> str:
+    return s + NBSP * max(0, n - len(s))
+
+
 class LocalRadio:
     def __init__(self):
         self.proc = None
 
     async def start(self):
+        # A start right after another radio was stopped can find the GPIO lines still claimed; meshcore-pi
+        # then keeps running with a half-configured radio (it never completes a transmit). Detect and retry.
+        for attempt in range(3):
+            try:
+                return await self._start_once()
+            except RuntimeError as e:
+                if attempt == 2 or 'already in use' in str(e) or 'not available' in str(e):
+                    raise
+                await asyncio.sleep(3)
+
+    async def _start_once(self):
         if not available():
             raise RuntimeError(f'local radio not available (need {SPIDEV}); run: {APP} install')
         if not _port_free():
@@ -947,9 +1000,12 @@ class LocalRadio:
                 try:
                     with open(pi_log, 'rb') as f:
                         f.seek(0 if os.path.getsize(pi_log) < pi_start else pi_start)
-                        if READY in f.read():
-                            await asyncio.sleep(0.3)
-                            return
+                        text = f.read()
+                    if b'Unable to configure interface' in text:
+                        raise RuntimeError('meshcore-pi could not set up the radio (GPIO busy?)')
+                    if READY in text:
+                        await asyncio.sleep(0.3)
+                        return
                 except OSError:
                     pass
                 await asyncio.sleep(0.25)
@@ -1138,6 +1194,8 @@ def valid_mv(mv):
 
 def local_battery():
     """(percent, status, volts) of this machine's battery (the CardputerZero's bq27220), or None."""
+    if REMOTE:
+        return None                               # this PC's battery says nothing about the radio's
     try:
         for name in sorted(os.listdir('/sys/class/power_supply')):
             d = os.path.join('/sys/class/power_supply', name)
@@ -1401,14 +1459,14 @@ class ConnectionMixin:
 
     def connect_to(self):
         self.connecting = True
-        self.status = 'connecting to local radio...'
+        self.status = f'connecting to {self.target()}...'
         self.dirty = True
         asyncio.create_task(self.connect())
 
     async def connect(self):
         mc = None
         try:
-            self.status = 'starting local radio...'
+            self.status = 'starting radio...' if not REMOTE else f'connecting to {REMOTE}...'
             self.dirty = True
             await ensure_daemon()
             mc = MeshCore(TCPConnection(HOST, DAEMON_PORT))
@@ -1785,7 +1843,7 @@ class MessagingMixin:
         bh = min(h - 2, len(sr['hits']) + 3)
         y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
         for y in range(bh):
-            scr.addstr(y0 + y, x0, ' ' * bw, theme_REV)
+            scr.addstr(y0 + y, x0, blank(bw), theme_REV)
         shown = len(sr['hits'])
         more = f' (first {shown} of {sr["total"]})' if sr['total'] > shown else ''
         scr.addnstr(y0, x0 + 1, f'Search "{sr["q"]}": {sr["total"]} match(es){more}', bw - 2, theme_REV | curses.A_BOLD)
@@ -1795,7 +1853,7 @@ class MessagingMixin:
             who = f'{self.name_for(key)}: ' if key else ''
             line = f'{hhmm(m.recv or m.ts)} {who}{m.who + ": " if m.who and m.who != "me" else ""}{m.text}'
             attr = theme_SEL if top + i == sr['sel'] else theme_REV
-            scr.addnstr(y0 + 1 + i, x0 + 1, line.replace('\n', ' ').ljust(bw - 2), bw - 2, attr)
+            scr.addnstr(y0 + 1 + i, x0 + 1, pad(line.replace('\n', ' '), bw - 2), bw - 2, attr)
         scr.addnstr(y0 + bh - 1, x0 + 1, 'Enter jump to message · Esc close', bw - 2, theme_REV | curses.A_DIM)
         curses.curs_set(0)
 
@@ -1859,13 +1917,14 @@ class MessagingMixin:
         msgs = self.history.get(self.selected, [])
         page = max(1, self.last_body_h // 2)
         if k == '\t':
+            self.fsel = 0
             self.focus = 'fkeys'
         elif k == curses.KEY_LEFT:
             self.focus = 'side'
         elif k == curses.KEY_RIGHT:
             pass
         elif k == '\x1b':
-            self.focus = 'side'
+            self.focus_back()
         elif k == curses.KEY_UP:
             self.msg_sel = max(0, self.msg_sel - 1)
         elif k == curses.KEY_DOWN:
@@ -1912,7 +1971,7 @@ class MessagingMixin:
         bh = len(rows) + 3
         y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
         for y in range(bh):
-            scr.addstr(y0 + y, x0, ' ' * bw, theme_REV)
+            scr.addstr(y0 + y, x0, blank(bw), theme_REV)
         scr.addnstr(y0, x0 + 1, self.details_title, bw - 2, theme_REV | curses.A_BOLD)
         verdicts = self.details_title.startswith(('Trace', 'Ping', 'Route'))
         for i, line in enumerate(rows):
@@ -2310,7 +2369,7 @@ class SettingsMixin:
                 self.set_edit = self.set_edit[:-1]
             elif isinstance(k, str) and k.isprintable():
                 self.set_edit += k
-        elif k in ('\x1b', curses.KEY_F2):
+        elif k in ('\x1b', curses.KEY_F2, curses.KEY_F5):
             self.settings_open = False
         elif k == curses.KEY_UP:
             self.set_sel = max(0, self.set_sel - 1)
@@ -2370,11 +2429,11 @@ class SettingsMixin:
         bh = len(self.ADVERT_CHOICES) + 3
         y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
         for y in range(bh):
-            scr.addstr(y0 + y, x0, ' ' * bw, theme_REV)
+            scr.addstr(y0 + y, x0, blank(bw), theme_REV)
         scr.addnstr(y0, x0 + 1, 'Send advert', bw - 2, theme_REV | curses.A_BOLD)
         for i, (label, _) in enumerate(self.ADVERT_CHOICES):
             attr = theme_SEL if i == self.advert_sel else theme_REV
-            scr.addnstr(y0 + 1 + i, x0 + 1, label.ljust(bw - 2), bw - 2, attr)
+            scr.addnstr(y0 + 1 + i, x0 + 1, pad(label, bw - 2), bw - 2, attr)
         scr.addnstr(y0 + bh - 1, x0 + 1, 'Enter send · Esc cancel', bw - 2,
                     theme_REV | curses.A_DIM)
         curses.curs_set(0)
@@ -2385,14 +2444,14 @@ class SettingsMixin:
         bh = len(rows) + 4
         y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
         for y in range(bh):
-            scr.addstr(y0 + y, x0, ' ' * bw, theme_REV)
+            scr.addstr(y0 + y, x0, blank(bw), theme_REV)
         scr.addnstr(y0, x0 + 1, 'Options', bw - 2, theme_REV | curses.A_BOLD)
         for i, (label, val) in enumerate(rows):
             if i == self.set_sel and self.set_edit is not None:
                 val = self.set_edit + '_'
             line = f'{label:<31}{val}'
             attr = theme_SEL if i == self.set_sel else theme_REV
-            scr.addnstr(y0 + 1 + i, x0 + 1, line.ljust(bw - 2), bw - 2, attr)
+            scr.addnstr(y0 + 1 + i, x0 + 1, pad(line, bw - 2), bw - 2, attr)
         hint = 'Enter save · Esc cancel' if self.set_edit is not None else \
             ('←/→ theme · ' if self.SETTINGS[self.set_sel] == 'theme' else '') + 'Enter change · Esc close'
         scr.addnstr(y0 + bh - 1, x0 + 1, hint, bw - 2, theme_REV | curses.A_DIM)
@@ -2799,7 +2858,7 @@ class ContactsMixin:
 
     async def handle_cmenu_key(self, k):
         n = len(self.menu_actions())
-        if k in ('\x1b', curses.KEY_F7):
+        if k in ('\x1b', curses.KEY_F6):
             self.cmenu_open = False
         elif k == curses.KEY_UP:
             self.cmenu_sel = max(0, self.cmenu_sel - 1)
@@ -2841,11 +2900,11 @@ class ContactsMixin:
         bh = vis + 3
         y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
         for y in range(bh):
-            scr.addstr(y0 + y, x0, ' ' * bw, theme_REV)
-        scr.addnstr(y0, x0 + 1, self.name_for(self.selected), bw - 2, theme_REV | curses.A_BOLD)
+            scr.addstr(y0 + y, x0, blank(bw), theme_REV)
+        scr.addnstr(y0, x0 + 1, 'Actions: ' + self.name_for(self.selected), bw - 2, theme_REV | curses.A_BOLD)
         for i, (label, _) in enumerate(acts[off:off + vis], off):
             attr = theme_SEL if i == self.cmenu_sel else theme_REV
-            scr.addnstr(y0 + 1 + i - off, x0 + 1, label.ljust(bw - 2), bw - 2, attr)
+            scr.addnstr(y0 + 1 + i - off, x0 + 1, pad(label, bw - 2), bw - 2, attr)
         scr.addnstr(y0 + bh - 1, x0 + 1, 'Enter select · Esc close' + (' · ↑/↓ more' if vis < len(acts) else ''),
                     bw - 2, theme_REV | curses.A_DIM)
         curses.curs_set(0)
@@ -2855,10 +2914,10 @@ class ContactsMixin:
         bw = min(w - 2, 70)
         y0, x0 = max(0, h // 2 - 2), max(0, (w - bw) // 2)
         for y in range(4):
-            scr.addstr(y0 + y, x0, ' ' * bw, theme_REV)
+            scr.addstr(y0 + y, x0, blank(bw), theme_REV)
         scr.addnstr(y0, x0 + 1, a['label'], bw - 2, theme_REV | curses.A_BOLD)
         shown = '*' * len(a['text']) if a.get('secret') else a['text']
-        scr.addnstr(y0 + 1, x0 + 1, (shown + '_').ljust(bw - 2), bw - 2, theme_REV)
+        scr.addnstr(y0 + 1, x0 + 1, pad(shown + '_', bw - 2), bw - 2, theme_REV)
         if 'check' in a:
             scr.addnstr(y0 + 2, x0 + 1, f'[{"x" if a["check"] else " "}] {a["check_label"]}  (Tab)', bw - 2, theme_REV)
         scr.addnstr(y0 + 3, x0 + 1, 'Enter apply · Esc cancel', bw - 2, theme_REV | curses.A_DIM)
@@ -2872,11 +2931,11 @@ class ContactsMixin:
 class CommandsMixin:
     # Words that make a line starting with ':' a command (":quit", ":help"), as with '/'. Single letters are left
     # out, apart from q, h and ?, so smileys such as ":D" and ":p" stay messages; "::" sends a literal ':'.
-    COLON_COMMANDS = frozenset(('contact', 'ct', 'menu', 'ping', 'info', 'reboot', 'theme', 'advert', 'find', 'search',
+    COLON_COMMANDS = frozenset(('contact', 'ct', 'menu', 'actions', 'act', 'ping', 'info', 'reboot', 'theme', 'advert', 'find', 'search',
                                 'trace', 'channel', 'ch', 'quit', 'exit', 'connect', 'disconnect', 'reload', 'options',
                                 'settings', 'clear', 'cls', 'log', 'console', 'radio', 'rx', 'rxlog', 'repeaters',
                                 'help', 'q', 'h', '?', 'keep', 'stop'))
-    COMMAND_NAMES = ('advert', 'channel', 'clear', 'connect', 'contact', 'disconnect', 'help', 'info', 'log', 'menu', 'quit',
+    COMMAND_NAMES = ('act', 'actions', 'advert', 'channel', 'clear', 'connect', 'contact', 'disconnect', 'help', 'info', 'log', 'menu', 'quit',
                      'reload', 'repeaters', 'ping', 'radio', 'reboot', 'search', 'options', 'theme', 'trace', 'keep', 'stop')
 
     def complete(self):
@@ -2915,7 +2974,7 @@ class CommandsMixin:
             return
         name, _, arg = text[1:].partition(' ')
         name = name.lower()
-        if name in ('contact', 'ct', 'menu'):
+        if name in ('contact', 'ct', 'menu', 'actions', 'act'):
             self.open_contact_menu()
             self.dirty = True
             return
@@ -3014,22 +3073,23 @@ class CommandsMixin:
         ('z c f x', 'left / right / up / down whenever you are not typing (the arrows sit on the Fn layer)'),
         ('h j k l', 'the same, Vim style; G = end, gg = top, Ctrl-D / Ctrl-U = half page down / up'),
         ('PgUp / PgDn', 'scroll history'),
-        ('Enter', 'in the list: write a message (channels, contacts) or open the menu (repeaters, Log, Radio); in the input: send'),
-        ('F7', 'context menu of the selected item, from anywhere'),
-        ('Tab', 'list > messages > function keys > list (messages: Up/Down, Enter = details, r = resend)'),
+        ('Enter', 'in the list: write a message (channels, contacts), open the actions (repeaters, Log, Radio) or fold / unfold a heading (Channels, Contacts, ...); in the input: send'),
+        ('F6', 'Actions for the selected item (ping, trace, set path...), from anywhere'),
+        ('Tab', 'list > messages > each key of the bar in turn > list (messages: Up/Down, Enter = details, r = resend)'),
         ('Left / Right', 'list <-> messages; on the function keys: pick one, Enter presses it'),
-        ('Esc', 'back to the list (from the input, the messages and the function keys)'),
+        ('Esc', 'one step back: from the input, the messages or the function keys to where you came from (usually the list)'),
         ('Space, / or :', 'start typing from anywhere; / or : starts a command, so /q or :q always quits'),
-        ('F1', 'this help'),
-        ('F2', 'options (name, TX power, advert, theme, ...)'),
+        ('F4', 'this help (also F1). The bar on the bottom row sits above the keys 4 to 8: press Fn + the key under a label'),
+        ('F5', 'options (name, TX power, advert, theme, ...) (also F2)'),
+        ('F6', 'actions for the selected item (see above)'),
+        ('F7', 'Log: status messages (lights up on problems)'),
+        ('F8', 'quit (asks to confirm) (also F10)'),
         ('F3', 'choose device and connect / disconnect'),
         ('F9', 'Radio: every packet heard (Tab: select, Enter = details)'),
-        ('F8', 'Log: status messages (lights up on problems)'),
-        ('F10', 'quit (asks to confirm)'),
         ('^Q', 'quit immediately'),
         ('/keep [on|off]', 'keep the radio running when the last window closes (messages keep coming in)'),
         ('/stop', 'switch the radio off for good (all windows) and quit this one'),
-        ('^C, Alt-X, Alt-Q', 'ask whether to quit, like F10; the same key again, y or Enter says yes'),
+        ('^C, Alt-X, Alt-Q', 'ask whether to quit, like F8; the same key again, y or Enter says yes'),
         ('^A ^E', 'start / end of line'),
         ('^B ^F', 'cursor left / right'),
         ('^U ^K ^W', 'kill to start / end / previous word'),
@@ -3042,17 +3102,17 @@ class CommandsMixin:
         ('/help  /h  /?', 'this help'),
         ('/quit  /q', 'quit immediately'),
         ('/channel <name> [key]', 'create / join a channel (#name = public)'),
-        ('/contact  /menu', 'context menu of the selected item (F7)'),
+        ('/actions  /act', 'actions for the selected item (F6); /menu and /contact also work'),
         ('/connect  /c', 'reconnect to the local radio'),
         ('/disconnect  /d', 'disconnect from the radio'),
         ('/advert  /a', 'advert menu, or /advert zero|flood'),
         ('/clear', 'empty the selected conversation (Log, Radio, channel or chat)'),
-        ('/log  /console', 'show the Log (F8)'),
+        ('/log  /console', 'show the Log (F7)'),
         ('/radio  /rxlog', 'show the Radio packet list (F9)'),
         ('/search  /f', 'search all messages: /search <text>'),
         ('/trace  /t', 'trace hops: /trace 78,64,78 or repeater names'),
         ('/reload  /r', 'reload contacts and channels'),
-        ('/options  /o  /settings', 'options (F2)'),
+        ('/options  /o  /settings', 'options (F5)'),
         ('/ping [name]', 'ping the selected or named repeater / room server'),
         ('/info  /i', 'this radio: public key, firmware, battery, ...'),
         ('/reboot', 'reboot the radio (asks first)'),
@@ -3072,7 +3132,7 @@ class CommandsMixin:
         bh = len(rows) + 3
         y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
         for y in range(bh):
-            scr.addstr(y0 + y, x0, ' ' * bw, theme_REV)
+            scr.addstr(y0 + y, x0, blank(bw), theme_REV)
         scr.addnstr(y0, x0 + 1, f'Help — {APP} {__version__}', bw - 2, theme_REV | curses.A_BOLD)
         for i, (a, b) in enumerate(rows):
             if a and not b:
@@ -3114,7 +3174,7 @@ class UiMixin:
         if self.confirm_quit:                 # the quit question beats everything else, windows included
             if k in ('y', 'Y', '\n') or k in self.QUIT_KEYS:      # the shortcut again counts as yes
                 self.quit = True
-            elif k in ('n', 'N', '\x1b', curses.KEY_F10):
+            elif k in ('n', 'N', '\x1b', curses.KEY_F10, curses.KEY_F8):
                 self.confirm_quit = False
             self.dirty = True
             return
@@ -3188,22 +3248,22 @@ class UiMixin:
         if self.advert_menu_open:
             await self.handle_advert_key(k)
             return
-        if k == curses.KEY_F10:
+        if k in (curses.KEY_F8, curses.KEY_F10):                  # Quit
             self.confirm_quit = True
             self.dirty = True
             return
-        if k == curses.KEY_F7 and not self.settings_open:
+        if k == curses.KEY_F6 and not self.settings_open:         # Act(ions)
             self.open_contact_menu()
             self.dirty = True
             return
-        if k == curses.KEY_F1:
+        if k in (curses.KEY_F4, curses.KEY_F1):                   # Help
             self.help_open, self.help_scroll = True, 0
             self.dirty = True
             return
-        if k in (curses.KEY_F8, curses.KEY_F9):
-            self.select(LOG_KEY if k == curses.KEY_F8 else RX_KEY)
+        if k in (curses.KEY_F7, curses.KEY_F9):                   # Log, Radio (RX log)
+            self.select(LOG_KEY if k == curses.KEY_F7 else RX_KEY)
             return
-        if k == curses.KEY_F2 and not self.settings_open:
+        if k in (curses.KEY_F5, curses.KEY_F2) and not self.settings_open:   # Opts
             self.settings_open = True
             self.dirty = True
             return
@@ -3232,7 +3292,7 @@ class UiMixin:
                 else:
                     self.focus = 'side'
             elif k == '\x1b':
-                self.focus = 'side'
+                self.focus_back()
             elif k in ('\x7f', '\b'):
                 if self.pos:
                     self.buf = self.buf[:self.pos - 1] + self.buf[self.pos:]
@@ -3260,16 +3320,16 @@ class UiMixin:
                 self.buf = self.buf[:self.pos] + self.kill + self.buf[self.pos:]
                 self.pos += len(self.kill)
             elif o == 16:                      # ^P  previous conversation
-                self.move(-1)
+                self.move(-1, False)
             elif o == 14:                      # ^N  next conversation
-                self.move(1)
+                self.move(1, False)
             elif k.isprintable():
                 self.buf = self.buf[:self.pos] + k + self.buf[self.pos:]
                 self.pos += 1
         elif k == curses.KEY_UP:
-            self.move(-1)
+            self.move(-1, False)
         elif k == curses.KEY_DOWN:
-            self.move(1)
+            self.move(1, False)
         elif k == curses.KEY_PPAGE:
             self.scroll += 5
         elif k == curses.KEY_NPAGE:
@@ -3292,7 +3352,7 @@ class UiMixin:
             await self.toggle_connection()
         self.dirty = True
 
-    FKEYS = ('F1', 'F2', 'F3', 'F7', 'F8', 'F9', 'F10')
+    FKEYS = ('F4', 'F5', 'F6', 'F7', 'F8')        # the bar: five slots above Fn+4 ... Fn+8
 
     async def handle_fkeys_key(self, k) -> bool:
         """Keys while the function key bar has focus: Left/Right pick one, Enter presses it."""
@@ -3301,10 +3361,13 @@ class UiMixin:
             self.fsel = (self.fsel - 1) % n
         elif k == curses.KEY_RIGHT:
             self.fsel = (self.fsel + 1) % n
-        elif k == '\t':
-            self.focus = 'side'
+        elif k == '\t':                       # on through every slot of the bar, then back to the list
+            if self.fsel < n - 1:
+                self.fsel += 1
+            else:
+                self.focus = 'side'
         elif k in ('\x1b', curses.KEY_UP):
-            self.focus = 'side'
+            self.focus_back()
         elif k == '\n':
             await self.handle_key(getattr(curses, 'KEY_' + self.FKEYS[self.fsel]))
         elif k in ('/', ':', ' '):
@@ -3356,7 +3419,13 @@ class UiMixin:
         elif k == curses.KEY_NPAGE:
             self.scroll = max(0, self.scroll - 5)
         elif k in (curses.KEY_HOME, curses.KEY_END):
-            self.select(self.entries()[0 if k == curses.KEY_HOME else -1][0])
+            rows = self.side_rows()
+            if rows:
+                self.goto(rows[0 if k == curses.KEY_HOME else -1][1])
+        elif k == '\n' and self.cursor_header():
+            self.toggle_group(self.cursor_header()[1])
+        elif k == curses.KEY_RIGHT and self.cursor_header() and self.cursor_header()[1] in self.collapsed:
+            self.toggle_group(self.cursor_header()[1])
         elif k == '\n':
             if self.can_chat():
                 self.focus = 'input'          # the prompt is only active after an explicit Enter
@@ -3367,7 +3436,10 @@ class UiMixin:
                 self.focus = 'msgs'
                 self.msg_sel = self.message_on_row_of_list()
             elif k == '\t':
+                self.fsel = 0
                 self.focus = 'fkeys'
+        elif k == curses.KEY_LEFT and self.cursor_header() and self.cursor_header()[1] not in self.collapsed:
+            self.toggle_group(self.cursor_header()[1])
         elif k in (curses.KEY_LEFT, '\x1b'):
             pass
         elif k in ('/', ':', ' '):
@@ -3381,16 +3453,19 @@ class UiMixin:
         self.dirty = True
         return True
 
-    def fkey_labels(self, w: int) -> list[str]:
-        """The function key bar: 'F1 Help  F2 Options ...' when it fits, else bare names (' Help  Opts  Conn ...'):
-        on the small screen you reach the keys with Tab and Enter, so the F-numbers matter less (F1 lists them)."""
-        keys = [('F1', 'Help', 'Help'), ('F2', 'Options', 'Opts'),
-                ('F3', 'Disconnect' if self.mc else 'Connect', 'Disc' if self.mc else 'Conn'),
-                ('F7', 'Menu', 'Menu'), ('F8', 'Log', 'Log'), ('F9', 'RX log', 'RX'), ('F10', 'Quit', 'Quit')]
-        full = [f'{k} {v}' for k, v, _ in keys]
-        if 1 + sum(len(t) + 2 for t in full) - 2 <= w - 1:
-            return full
-        return [short for _, _, short in keys]
+    BAR = (('Help', 'Help'), ('Options', 'Opts'), ('Actions', 'Act'), ('Log', 'Log'), ('Quit', 'Quit'))
+
+    def fkey_slots(self, w: int) -> list[tuple[int, int, str]]:
+        """The function-key bar as (x, width, text). The built-in keyboard has five keys (4 to 8) fully under
+        the screen, so the bar is five slots in a row, each name centred over its key; Fn+4 ... Fn+8 press them.
+        A wide terminal gets wider slots and the key name too ('F4 Help')."""
+        slot = max(5, min(w // 5, 8 if w < 70 else 14))
+        x0 = max(0, (w - 5 * slot) // 2)
+        out = []
+        for i, (long, short) in enumerate(self.BAR):
+            name = f'{self.FKEYS[i]} {long}' if slot >= 11 else (short if slot < 8 else long)
+            out.append((x0 + i * slot, slot, name[:slot - 1].center(slot)))
+        return out
 
     @staticmethod
     def sidebar_width(w: int) -> int:
@@ -3414,34 +3489,23 @@ class UiMixin:
         body_h = h - 3                      # title row at 0, input + status at bottom
 
         # sidebar
-        ents = self.entries()
-        rows: list[tuple[str, tuple | None]] = []
-        n_ch = len(self.channels)
-        rows.append(('Channels', None))
-        for k, n in ents[:n_ch]:
-            rows.append((n, k))
-        people = [(k, n) for k, n in ents[n_ch:-2] if not self.is_infra(k)]
-        infra = [(k, n) for k, n in ents[n_ch:-2] if self.is_infra(k)]
-        rows.append(('Contacts', None))
-        rows += [(n, k) for k, n in people]
-        if infra:
-            rows.append(('Repeaters', None))
-            rows += [(n, k) for k, n in infra]
-        rows.append(('Console', None))
-        for k, n in ents[-2:]:
-            rows.append((n, k))
-        sel_row = next((i for i, (_, k) in enumerate(rows) if k == self.selected), 0)
+        rows = self.side_rows()
+        keys = [k for _, k, _ in rows]
+        cur = self.cursor_header() or self.selected
+        sel_row = keys.index(cur) if cur in keys else 0
         top = max(0, min(sel_row - body_h // 2, len(rows) - body_h))
-        for y, (label, key) in enumerate(rows[top:top + body_h]):
-            if key is None:
-                scr.addnstr(1 + y, 0, label, sw - 1, theme_HEAD)
-                continue
-            u = self.unread.get(key, 0)
+        for y, (label, key, u) in enumerate(rows[top:top + body_h]):
             tail = f' {u}' if u else ''
-            text = ' ' + label[:sw - 3 - len(tail)]
-            text = text.ljust(sw - 1 - len(tail)) + tail
-            attr = theme_SEL if key == self.selected else (
-                theme_UNREAD if u else curses.A_NORMAL)
+            lead = '' if key[0] == 'h' else ' '
+            text = pad(lead + label[:sw - 1 - len(tail) - 2 * len(lead)], sw - 1 - len(tail)) + tail
+            if key == cur:
+                attr = theme_SEL
+            elif key[0] == 'h':
+                attr = theme_HEAD | (curses.A_BOLD if u else 0)
+            elif key == self.selected and self.cursor_header():
+                attr = curses.A_BOLD                 # the open conversation while the cursor rests on a heading
+            else:
+                attr = theme_UNREAD if u else curses.A_NORMAL
             scr.addnstr(1 + y, 0, text, sw - 1, attr)
             if key == self.selected:
                 self.side_row = (key, 1 + y)
@@ -3508,20 +3572,12 @@ class UiMixin:
                 hint = ('commands go to the repeater: ver, clock, advert, ...' if cli == 'on'
                         else 'not logged in: Esc, Enter, then "CLI" to manage this repeater')
                 scr.addnstr(h - 2, len(prompt), hint, max(0, w - 1 - len(prompt)), curses.A_DIM)
-        labels = self.fkey_labels(w)
-        scr.addnstr(h - 1, 0, ''.ljust(w), w - 1, theme_REV)
-        first = 0
-        if self.focus == 'fkeys':             # on a very narrow screen drop the leading keys until the chosen one fits
-            while first < self.fsel and 1 + sum(len(t) + 2 for t in labels[first:self.fsel + 1]) > w - 1:
-                first += 1
-        x = 1
-        for i, text in enumerate(labels[first:], first):
+        scr.addnstr(h - 1, 0, blank(w), w - 1, theme_REV)
+        for i, (x, width, text) in enumerate(self.fkey_slots(w)):
             chosen = self.focus == 'fkeys' and i == self.fsel
+            text = text.replace(' ', NBSP)
             scr.addnstr(h - 1, x, text, max(0, w - 1 - x),
                         ((theme_REV ^ curses.A_REVERSE) | curses.A_BOLD) if chosen else theme_REV)
-            x += len(text) + 2
-            if x >= w - 1:
-                break
         scr.move(h - 2, min(w - 1, len(prompt) + self.pos - start))
         curses.curs_set(1 if self.focus == 'input' else 0)
         if self.settings_open:
@@ -3555,7 +3611,33 @@ class UiMixin:
 # app
 # ======================================================================
 
-class App(ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMixin, ChannelsMixin, RepeaterMixin, CommandsMixin, UiMixin):
+class FocusTrail:
+    """`focus` remembers where you came from, so Esc goes back one step instead of straight to the list.
+    Going to a place that is already on the trail cuts the trail back to it (no loops)."""
+    _focus = None
+
+    @property
+    def focus(self):
+        return self._focus
+
+    @focus.setter
+    def focus(self, new):
+        old = self._focus
+        if new == old:
+            return
+        trail = self.__dict__.setdefault('focus_trail', [])
+        if new in trail:
+            del trail[trail.index(new):]
+        elif old is not None:
+            trail.append(old)
+        self._focus = new
+
+    def focus_back(self):
+        trail = self.__dict__.setdefault('focus_trail', [])
+        self._focus = trail.pop() if trail else 'side'
+
+
+class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMixin, ChannelsMixin, RepeaterMixin, CommandsMixin, UiMixin):
     @property
     def status(self) -> str:
         return self._status
@@ -3571,7 +3653,8 @@ class App(ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMixin, Channel
 
     def save_config(self):
         cfg = {'show_repeaters': self._show_repeaters, 'auto_connect': self.auto_connect,
-               'keep_daemon': self.keep_daemon, 'theme': self.theme, 'favorites': sorted(self.favorites), 'channels': self.chan_prefs, 'retries': self.retries}
+               'keep_daemon': self.keep_daemon, 'theme': self.theme, 'favorites': sorted(self.favorites), 'channels': self.chan_prefs, 'retries': self.retries,
+               'collapsed': sorted(self.collapsed)}
         try:
             os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
             with open(CONFIG_FILE, 'w') as f:
@@ -3653,6 +3736,9 @@ class App(ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMixin, Channel
         self.quit = False
         self.settings_open = False
         self.set_sel = 0
+        self.focus_trail: list[str] = []
+        self.cursor: tuple | None = None     # a heading (Channels, Contacts, ...) the list cursor is on, else None
+        self.collapsed: set[str] = set(cfg.get('collapsed', []))
         self.focus = 'side'                  # 'side' (list) | 'input' | 'msgs' | 'fkeys' (function key bar)
         self.fsel = 0                        # highlighted entry of the function key bar
         self.keepalive_task: asyncio.Task | None = None
@@ -3766,25 +3852,71 @@ class App(ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMixin, Channel
 
     def select(self, key: tuple):
         self.selected = key
+        self.cursor = None
         if self.focus == 'msgs':
             self.focus = 'side'
         self.unread.pop(key, None)
         self.scroll = 0
         self.dirty = True
 
-    def move(self, delta: int):
+    GROUPS = ('Channels', 'Contacts', 'Repeaters', 'Console')
+
+    def side_rows(self) -> list[tuple[str, tuple, int]]:
+        """The visible rows of the list: (label, key, unread). Headings are ('h', name) keys; the cursor can sit on
+        them and Enter folds the group, so a long contact list can be put away."""
         ents = self.entries()
-        if not ents:
+        n_ch = len(self.channels)
+        rest = ents[n_ch:-2]
+        groups = {'Channels': ents[:n_ch], 'Contacts': [(k, n) for k, n in rest if not self.is_infra(k)],
+                  'Repeaters': [(k, n) for k, n in rest if self.is_infra(k)], 'Console': ents[-2:]}
+        rows = []
+        for name in self.GROUPS:
+            items = groups[name]
+            if name == 'Repeaters' and not items:
+                continue
+            if name in self.collapsed:
+                rows.append((f'+ {name}', ('h', name), sum(self.unread.get(k, 0) for k, _ in items)))
+            else:
+                rows.append((f'- {name}', ('h', name), 0))
+                rows += [(n, k, self.unread.get(k, 0)) for k, n in items]
+        return rows
+
+    def cursor_header(self) -> tuple | None:
+        """The heading under the list cursor, if it is on one (and that heading is still there)."""
+        if self.cursor and self.cursor[0] == 'h' and any(k == self.cursor for _, k, _ in self.side_rows()):
+            return self.cursor
+        return None
+
+    def toggle_group(self, name: str):
+        self.collapsed ^= {name}
+        self.save_config()
+        self.dirty = True
+
+    def goto(self, key: tuple):
+        """Put the list cursor on a row: a conversation is opened (and marked read), a heading is only marked."""
+        if key[0] == 'h':
+            self.cursor = key
+            if self.focus == 'msgs':
+                self.focus = 'side'
+            self.dirty = True
+        else:
+            self.select(key)
+
+    def move(self, delta: int, headings: bool = True):
+        """Next / previous row of the list; while typing (headings=False) only conversations count."""
+        rows = [r for r in self.side_rows() if headings or r[1][0] != 'h']
+        if not rows:
             return
-        keys = [k for k, _ in ents]
-        i = keys.index(self.selected) if self.selected in keys else -1
-        self.select(keys[max(0, min(len(keys) - 1, i + delta))])
+        keys = [k for _, k, _ in rows]
+        cur = (self.cursor_header() if headings else None) or (self.selected if self.selected in keys else None)
+        i = keys.index(cur) if cur in keys else (-1 if delta > 0 else len(keys))
+        self.goto(keys[max(0, min(len(keys) - 1, i + delta))])
 
     def contacts(self) -> dict:
         return self.mc.contacts if self.mc else self.contact_cache
 
     def target(self) -> str:
-        return 'local radio'
+        return f'radio on {REMOTE.split("@")[-1]}' if REMOTE else 'local radio'
 
     def need_radio(self) -> bool:
         if self.mc is None:
@@ -4088,6 +4220,47 @@ def daemon_pid():
         return None
 
 
+REMOTE = None                      # [user@]host of the machine that has the radio (set by --remote), else None
+REMOTE_PORT = int(os.environ.get('CARDPUTER_MC_REMOTE_PORT', '5001'))
+TUNNEL = None
+
+
+def _port_open(port: int) -> bool:
+    try:
+        with socket.create_connection((HOST, port), 1):
+            return True
+    except OSError:
+        return False
+
+
+def open_tunnel(host: str):
+    """--remote: start the radio daemon on `host` (over ssh) and forward its port to this machine. The daemon has no
+    password, so it only listens on its own localhost; the ssh login is what protects it."""
+    global REMOTE, TUNNEL
+    REMOTE = host
+    if _port_open(DAEMON_PORT):
+        return                                        # already forwarded (an open window's tunnel)
+    ssh = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10']
+    try:
+        r = subprocess.run(ssh + [host, f'~/.local/bin/{APP} up'], capture_output=True, text=True, timeout=150)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f'ssh to {host} failed: {e}')
+    if r.returncode != 0:
+        raise RuntimeError(f'could not start the radio on {host}: {(r.stderr or r.stdout).strip()[-300:]}')
+    TUNNEL = subprocess.Popen(ssh + ['-N', '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=15',
+                                     '-L', f'{HOST}:{DAEMON_PORT}:{HOST}:{REMOTE_PORT}', host],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                              preexec_fn=_die_with_parent)
+    atexit.register(lambda: TUNNEL.poll() is None and TUNNEL.terminate())
+    for _ in range(40):
+        if _port_open(DAEMON_PORT):
+            return
+        if TUNNEL.poll() is not None:
+            raise RuntimeError(f'ssh tunnel to {host} failed: {TUNNEL.stderr.read().decode(errors="replace").strip()[-300:]}')
+        time.sleep(0.25)
+    raise RuntimeError(f'ssh tunnel to {host} did not come up')
+
+
 async def daemon_reachable() -> bool:
     try:
         _, writer = await asyncio.wait_for(asyncio.open_connection(HOST, DAEMON_PORT), 2)
@@ -4101,6 +4274,11 @@ async def ensure_daemon():
     """Make sure the radio daemon is up, starting it (detached, so it outlives this window) when it is not."""
     if await daemon_reachable():
         return
+    if REMOTE:
+        await asyncio.to_thread(open_tunnel, REMOTE)
+        if await daemon_reachable():
+            return
+        raise RuntimeError(f'radio on {REMOTE} not reachable')
     if not available():
         raise RuntimeError(f'local radio not available (need {SPIDEV}); run: {APP} install')
     try:
@@ -4214,16 +4392,299 @@ async def run(scr, args):
         app.sync_history()
         await app.disconnect()
 
+# ======================================================================
+# command line (no screen): send, read, contacts, ...
+# ======================================================================
+
+class CliError(Exception):
+    def __init__(self, text: str, code: int = 1):
+        super().__init__(text)
+        self.code = code
+
+
+async def cli_app(prehook=None) -> 'App':
+    """A window without a screen: connects to the radio daemon like the chat does (and so also collects what came in
+    meanwhile into the shared history), for the commands below."""
+    app = App(argparse.Namespace())
+    if prehook:
+        prehook(app)
+    await app.connect()
+    if app.mc is None:
+        raise CliError(app.status or 'could not connect to the radio')
+    await asyncio.sleep(0)                        # let the title-bar battery task start, then drop it (no screen here)
+    if app.keepalive_task:
+        app.keepalive_task.cancel()
+        app.keepalive_task = None
+    return app
+
+
+async def cli_finish(app: 'App'):
+    app.sync_history()
+    await app.disconnect()
+
+
+def cli_contacts(app: 'App') -> list[tuple[tuple, str, dict]]:
+    return [(('d', c['public_key'][:12]), c.get('adv_name') or c['public_key'][:8], c) for c in app.contacts().values()]
+
+
+def resolve_target(app: 'App', text: str) -> tuple[tuple, str]:
+    """Contact or channel by name: exact, then prefix, then part of the name (a leading # means a channel)."""
+    low = text.strip().lower()
+    if not low:
+        raise CliError('no target given', 2)
+    only_chan = low.startswith('#')
+    ch = [(('c', i), n) for i, n in app.channels]
+    ct = [] if only_chan else [(k, n) for k, n, _ in cli_contacts(app)]
+    norm = lambda n: n.lower().lstrip('#')
+    want = low.lstrip('#')
+    keys = [] if only_chan or not re.fullmatch(r'[0-9a-f]{4,}', low) else \
+        [(k, n) for k, n, c in cli_contacts(app) if c['public_key'].startswith(low)]
+    tiers = [[x for x in ch if norm(x[1]) == want] if only_chan else [],
+             [x for x in ct if x[1].lower() == low],
+             [x for x in ch if norm(x[1]) == want],
+             [x for x in ct if x[1].lower().startswith(low)],
+             keys,
+             [x for x in ct if low in x[1].lower()] + [x for x in ch if want in norm(x[1])]]
+    for hits in tiers:
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            raise CliError(f'{text!r} is ambiguous: ' + ', '.join(n for _, n in hits[:8]), 2)
+    raise CliError(f'unknown contact or channel {text!r} (see: {APP} contacts, {APP} channels)', 2)
+
+
+def cli_line(key: tuple, m: 'Msg', date: bool = False) -> str:
+    when = datetime.fromtimestamp(m.recv or m.ts or 0).strftime('%Y-%m-%d %H:%M' if date else '%H:%M')
+    who = 'me' if m.mine else m.who
+    mark = {'acked': ' [delivered]', 'failed': ' [failed]', 'sent': ' [sent]'}.get(m.status, '') if m.mine else ''
+    return f'{when} {who + ": " if who else ""}{m.text}{mark}'
+
+
+def cli_route(app: 'App', c: dict) -> str:
+    n = c.get('out_path_len', -1)
+    if n in (-1, 255):
+        return 'flood'
+    if n == 0:
+        return 'direct'
+    return ' > '.join(app.hop_name(h) for h in app.hops_of(c.get('out_path', ''), n))
+
+
+async def cmd_send(a) -> int:
+    text = sys.stdin.read().rstrip('\n') if a.text == ['-'] else ' '.join(a.text)
+    if not text.strip():
+        raise CliError('nothing to send', 2)
+    app = await cli_app()
+    try:
+        key, name = resolve_target(app, a.target)
+        if key[0] == 'd':
+            c = next(c for k, _, c in cli_contacts(app) if k == key)
+            if c.get('type') == 2:
+                raise CliError(f'{name} is a repeater: it takes commands, not chat messages', 2)
+        app.selected = key
+        await app.send(text)
+        msg = next((m for m in reversed(app.history.get(key, [])) if m.mine and m.text == text), None)
+        if msg is None or msg.status == 'failed':
+            raise CliError(f'send failed: {app.status}')
+        if key[0] == 'c':
+            print(f'sent to {name}')
+            return 0
+        if a.no_wait:
+            print(f'sent to {name} (not waiting for the acknowledgement)')
+            return 0
+        t0 = time.time()
+        wait = a.timeout or (app.retries + 1) * (msg.info.get('suggested_timeout', 10000) / 1000 + 2) + 3
+        while msg.status == 'sent' and time.time() - t0 < wait:
+            await asyncio.sleep(0.25)
+        if msg.status == 'acked':
+            print(f'delivered to {name} ({time.time() - t0:.1f} s)')
+            return 0
+        raise CliError(f'no acknowledgement from {name} after {time.time() - t0:.0f} s' if msg.status == 'sent'
+                       else f'send failed: {app.status}')
+    finally:
+        await cli_finish(app)
+
+
+async def cmd_contacts(a) -> int:
+    app = await cli_app()
+    try:
+        rows = sorted(cli_contacts(app), key=lambda r: -r[2].get('last_advert', 0))
+        if a.pattern:
+            rows = [r for r in rows if a.pattern.lower() in r[1].lower()]
+        if a.json:
+            print(json.dumps([{'name': n, 'type': NODE_TYPES.get(c.get('type'), '?'), 'public_key': c['public_key'],
+                               'last_advert': c.get('last_advert', 0), 'route': cli_route(app, c)} for _, n, c in rows], indent=1))
+            return 0
+        for _, n, c in rows:
+            seen = datetime.fromtimestamp(c['last_advert']).strftime('%Y-%m-%d %H:%M') if c.get('last_advert') else 'never'
+            print(f'{n:<24} {NODE_TYPES.get(c.get("type"), "?"):<9} {seen}  {cli_route(app, c)}')
+        return 0
+    finally:
+        await cli_finish(app)
+
+
+async def cmd_channels(a) -> int:
+    app = await cli_app()
+    try:
+        for i, n in app.channels:
+            print(f'{i}  {n}')
+        return 0
+    finally:
+        await cli_finish(app)
+
+
+async def cmd_read(a) -> int:
+    app = await cli_app()
+    try:
+        if not a.target:                                       # overview of all conversations
+            for key, msgs in app.history.items():
+                if not key or key in (RX_KEY, LOG_KEY) or not msgs:
+                    continue
+                print(f'{app.name_for(key):<24} {len(msgs):>4} messages, last {cli_line(key, msgs[-1], True)[:60]}')
+            return 0
+        key, name = resolve_target(app, a.target)
+        msgs = app.history.get(key, [])[-a.n:]
+        if a.json:
+            print(json.dumps([{'time': m.recv or m.ts, 'who': 'me' if m.mine else m.who, 'text': m.text,
+                               'mine': m.mine, 'status': m.status} for m in msgs], indent=1))
+        else:
+            for m in msgs:
+                print(cli_line(key, m, a.dates))
+        return 0
+    finally:
+        await cli_finish(app)
+
+
+async def cmd_info(a) -> int:
+    app = await cli_app()
+    try:
+        si = dict(app.mc.self_info or {})
+        bat = await app.mc.commands.get_bat()
+        mv = valid_mv(bat.payload.get('level')) if bat.type != EventType.ERROR else None
+        out = {'name': si.get('name'), 'public_key': si.get('public_key'), 'frequency_mhz': si.get('radio_freq'),
+               'bandwidth_khz': si.get('radio_bw'), 'spreading_factor': si.get('radio_sf'), 'coding_rate': si.get('radio_cr'),
+               'tx_power_dbm': si.get('tx_power'), 'battery': battery_text(mv), 'contacts': len(app.contacts()),
+               'channels': [n for _, n in app.channels], 'radio': app.target()}
+        if a.json:
+            print(json.dumps(out, indent=1, default=str))
+        else:
+            for k, v in out.items():
+                print(f'{k.replace("_", " "):<18} {", ".join(v) if isinstance(v, list) else v}')
+        return 0
+    finally:
+        await cli_finish(app)
+
+
+async def cmd_advert(a) -> int:
+    app = await cli_app()
+    try:
+        r = await app.mc.commands.send_advert(flood=a.flood)
+        if r.type == EventType.ERROR:
+            raise CliError(f'advert failed: {describe_error(r.payload)}')
+        print('advert sent' + (' (flood)' if a.flood else ''))
+        return 0
+    finally:
+        await cli_finish(app)
+
+
+async def cmd_listen(a) -> int:
+    """Print incoming messages as they arrive (those queued while no window was open come first); they also go into the
+    shared history, so the chat windows show them too."""
+    def hook(app):
+        orig = app.add
+
+        def add(key, msg, unread=True):
+            orig(key, msg, unread)
+            if not msg.mine and key not in (RX_KEY, LOG_KEY):
+                print(f'[{app.name_for(key)}] {cli_line(key, msg, a.dates)}', flush=True)
+                add.count += 1
+        add.count = 0
+        app.add = add
+    app = await cli_app(hook)
+    try:
+        t0 = time.time()
+        while not (a.count and app.add.count >= a.count) and not (a.seconds and time.time() - t0 >= a.seconds):
+            await asyncio.sleep(0.5)
+            if int(time.time() - t0) % 5 == 0:
+                app.sync_history()
+        return 0
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        return 0
+    finally:
+        await cli_finish(app)
+
+
+def run_cli(fn, a) -> int:
+    root = logging.getLogger()
+    root.handlers[:] = [LOG]
+    root.setLevel(logging.INFO)
+    try:
+        return asyncio.run(fn(a))
+    except CliError as e:
+        print(f'{APP}: {e}', file=sys.stderr)
+        return e.code
+    except (RuntimeError, OSError) as e:
+        print(f'{APP}: {e}', file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog=APP, description='ncurses MeshCore chat for the M5 CardputerZero with the Cap-LoRa-1262',
         epilog=f'First run: {APP} install   (sets up meshcore-pi, a venv and {PI_CONFIG})')
     ap.add_argument('--version', action='version', version=f'{APP} {__version__}')
-    ap.add_argument('command', nargs='?', choices=['check', 'daemon', 'stop', 'status'],
-                    help='check: test the SX1262 wiring (no airtime); daemon: run the radio daemon in the foreground '
-                         '(chat windows start it by themselves); stop: stop it and switch the radio off; '
-                         'status: is it running; without a command the chat starts')
-    command = ap.parse_args().command
+    ap.add_argument('--remote', metavar='[USER@]HOST', default=os.environ.get('CARDPUTER_MC_REMOTE'),
+                    help='use the radio of another machine (the Cardputer): starts its radio daemon over ssh and tunnels to it '
+                         '(also CARDPUTER_MC_REMOTE). On a PC set up with: install --client')
+    sub = ap.add_subparsers(dest='command', metavar='command', description='without a command the chat starts')
+    sub.add_parser('check', help='test the SX1262 wiring (no airtime)')
+    sub.add_parser('daemon', help='run the radio daemon in the foreground (chat windows start it by themselves)')
+    sub.add_parser('up', help='start the radio daemon if it is not running, then exit')
+    sub.add_parser('stop', help='stop the radio daemon and switch the radio off')
+    sub.add_parser('status', help='is the radio daemon running')
+    sp = sub.add_parser('send', help='send a message: send Yoshi "hello", send "#test" hi there (TEXT - reads stdin)')
+    sp.add_argument('target', help='contact or channel name (a leading # = channel; a part of the name is enough)')
+    sp.add_argument('text', nargs='+')
+    sp.add_argument('--no-wait', action='store_true', help='do not wait for the acknowledgement of a direct message')
+    sp.add_argument('--timeout', type=float, metavar='SEC', help='how long to wait for the acknowledgement')
+    sp = sub.add_parser('read', help='show the stored conversation with a contact or channel (no TARGET: overview)')
+    sp.add_argument('target', nargs='?')
+    sp.add_argument('-n', type=int, default=20, help='number of messages (default 20)')
+    sp.add_argument('--dates', action='store_true', help='show the date too')
+    sp.add_argument('--json', action='store_true')
+    sp = sub.add_parser('contacts', help='list the contacts of the radio')
+    sp.add_argument('pattern', nargs='?', help='only names containing this')
+    sp.add_argument('--json', action='store_true')
+    sub.add_parser('channels', help='list the channels of the radio')
+    sp = sub.add_parser('info', help='what the radio says about itself (name, key, frequency, battery)')
+    sp.add_argument('--json', action='store_true')
+    sp = sub.add_parser('advert', help='announce this node (zero hop; --flood for everyone)')
+    sp.add_argument('--flood', action='store_true')
+    sp = sub.add_parser('listen', help='print incoming messages as they arrive (Ctrl-C ends)')
+    sp.add_argument('--count', type=int, metavar='N', help='stop after N messages')
+    sp.add_argument('--seconds', type=float, metavar='SEC', help='stop after this long')
+    sp.add_argument('--dates', action='store_true')
+    sp = sub.add_parser('install', help='set up this machine (--client: a PC that only uses a remote radio)')
+    sub.add_parser('uninstall', help='remove what install made')
+    opts = ap.parse_args()
+    command = opts.command
+    if opts.remote and command in ('check', 'daemon', 'up', 'stop', 'status'):
+        sys.exit(f'{APP}: {command} works on the machine that has the radio; use: ssh {opts.remote} {APP} {command}')
+    if opts.remote:
+        try:
+            open_tunnel(opts.remote)
+        except RuntimeError as e:
+            sys.exit(f'{APP}: {e}')
+    if command == 'up':
+        try:
+            asyncio.run(ensure_daemon())
+        except RuntimeError as e:
+            sys.exit(f'{APP}: {e}')
+        print('radio daemon: running')
+        sys.exit(0)
+    if command in ('send', 'read', 'contacts', 'channels', 'info', 'advert', 'listen'):
+        sys.exit(run_cli(globals()['cmd_' + command], opts))
     if command == 'check':
         sys.exit(check())
     if command == 'stop':
@@ -4237,7 +4698,7 @@ def main():
     args = argparse.Namespace()
     locale.setlocale(locale.LC_ALL, '')
     os.environ.setdefault('ESCDELAY', '25')   # ncurses waits 1000ms after Esc by default
-    # keep library log output off the screen; F8 shows it
+    # keep library log output off the screen; F7 shows it
     root = logging.getLogger()
     root.handlers[:] = [LOG]
     root.setLevel(logging.INFO)
