@@ -69,6 +69,12 @@ Esc goes back to the list. Tab goes list > messages > function-key bar > list. L
 list and the messages; on the function-key bar they pick a key (highlighted) and Enter presses it, so the F-keys
 are usable without reaching for the tiny Fn row. Typing in the list, the messages or the key bar does nothing.
 
+The arrow keys sit on the CardputerZero's Fn layer, so whenever you are not typing (not in the prompt, a question
+or a setting being edited) `z` `c` `f` `x` act as left, right, up and down, in the lists, menus and windows.
+
+The list on the left takes a quarter of the width (10 to 24 columns): a wide terminal keeps the full list, the
+built-in 45-column screen gives the messages 33 columns instead of 20.
+
 `/connect` reconnects, `/disconnect` stops the radio, F3 toggles. Chat history and UI settings are in
 `~/.config/cardputer-mc/`.
 

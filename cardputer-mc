@@ -483,7 +483,8 @@ RX_KEY = ('r', 0)           # 'Radio': received packets as a pseudo-conversation
 LOG_KEY = ('l', 0)          # 'Log': status messages and library log lines
 MAX_RETRIES = 5
 HISTORY_KEEP = 500          # messages kept per conversation
-SIDEBAR_W = 24
+SIDEBAR_W = 24               # the list's width on a roomy terminal
+MIN_SIDEBAR_W = 10           # ... and the least it shrinks to on a small one
 MAX_CHANNELS = 8
 NODE_TYPES = {1: 'client', 2: 'repeater', 3: 'room'}
 CTRL_Q, CTRL_C = 17, 3
@@ -2712,6 +2713,7 @@ class CommandsMixin:
     HELP = (
         ('Keys', ''),
         ('Up / Down', 'move through the list on the left'),
+        ('z c f x', 'left / right / up / down whenever you are not typing (the arrows sit on the Fn layer)'),
         ('PgUp / PgDn', 'scroll history'),
         ('Enter', 'in the list: write a message (channels, contacts) or open the menu (repeaters, Log, Radio); in the input: send'),
         ('F7', 'context menu of the selected item, from anywhere'),
@@ -2784,11 +2786,25 @@ class CommandsMixin:
 # ======================================================================
 
 class UiMixin:
+    # The CardputerZero keeps its arrow keys on the Fn layer. Where letters are not text, z c f x steer instead.
+    NAV_LETTERS = {'z': curses.KEY_LEFT, 'c': curses.KEY_RIGHT, 'f': curses.KEY_UP, 'x': curses.KEY_DOWN}
+
+    def letters_are_text(self) -> bool:
+        """True while typed letters are text: a question being answered, a setting being edited, the prompt."""
+        if self.ask or (self.settings_open and self.set_edit is not None):
+            return True
+        modal = (self.details is not None or self.help_open or self.confirm_quit or self.confirm_remove
+                 or self.settings_open or self.cmenu_open or self.advert_menu_open or self.search)
+        return self.focus == 'input' and not modal
+
     async def handle_key(self, k):
         if k == '\x0c':                       # Ctrl-L: full repaint
             self.repaint = True
             self.dirty = True
             return
+        if isinstance(k, str) and k in self.NAV_LETTERS and not self.confirm_quit and not self.confirm_remove \
+                and not self.letters_are_text():
+            k = self.NAV_LETTERS[k]
         if self.details is not None:
             self.dirty = True
             page = max(1, self.scr_h - 5)
@@ -3015,6 +3031,12 @@ class UiMixin:
         self.dirty = True
         return True
 
+    @staticmethod
+    def sidebar_width(w: int) -> int:
+        """A quarter of the width, between MIN_SIDEBAR_W and SIDEBAR_W: a big terminal keeps the full list, the
+        CardputerZero's 45 columns give the messages most of the room (the title bar shows the full name)."""
+        return max(MIN_SIDEBAR_W, min(SIDEBAR_W, w // 4))
+
     def draw(self, scr):
         h, w = scr.getmaxyx()
         self.scr_h = h
@@ -3022,11 +3044,11 @@ class UiMixin:
             scr.clear()
             self.repaint = False
         scr.erase()
-        if h < 6 or w < SIDEBAR_W + 20:
+        if h < 6 or w < MIN_SIDEBAR_W + 20:
             scr.addstr(0, 0, 'terminal too small'[:w - 1])
             scr.refresh()
             return
-        sw = SIDEBAR_W
+        sw = self.sidebar_width(w)
         mw = w - sw - 1
         body_h = h - 3                      # title row at 0, input + status at bottom
 
