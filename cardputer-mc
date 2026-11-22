@@ -1615,7 +1615,7 @@ class MessagingMixin:
         elif k == curses.KEY_RIGHT:
             pass
         elif k == '\x1b':
-            self.focus = 'input'
+            self.focus = 'side'
         elif k == curses.KEY_UP:
             self.msg_sel = max(0, self.msg_sel - 1)
         elif k == curses.KEY_DOWN:
@@ -1645,8 +1645,7 @@ class MessagingMixin:
             else:
                 self.show('Message details', self.message_details(msgs[self.msg_sel]))
         elif isinstance(k, str) and (k.isprintable() or k == '\x7f'):
-            self.focus = 'input'          # start typing: back to the input line
-            return False
+            pass                          # typing does not start a message; Left, then Enter on the item does
         else:
             return False
         self.dirty = True
@@ -2714,14 +2713,14 @@ class CommandsMixin:
         ('Keys', ''),
         ('Up / Down', 'move through the list on the left'),
         ('PgUp / PgDn', 'scroll history'),
-        ('Enter', 'in the list: context menu; in the input: send'),
-        ('Tab', 'list > input > messages > function keys > list (messages: Up/Down, Enter = details, r = resend)'),
+        ('Enter', 'in the list: write a message (channels, contacts) or open the menu (repeaters, Log, Radio); in the input: send'),
+        ('F7', 'context menu of the selected item, from anywhere'),
+        ('Tab', 'list > messages > function keys > list (messages: Up/Down, Enter = details, r = resend)'),
         ('Left / Right', 'list <-> messages; on the function keys: pick one, Enter presses it'),
-        ('Esc', 'back one step: function keys / messages > input > list'),
+        ('Esc', 'back to the list (from the input, the messages and the function keys)'),
         ('F1', 'this help'),
         ('F2', 'options (name, TX power, advert, theme, ...)'),
         ('F3', 'choose device and connect / disconnect'),
-        ('F7', 'context menu of the selected item (same as Enter in the list)'),
         ('F9', 'Radio: every packet heard (Tab: select, Enter = details)'),
         ('F8', 'Log: status messages (lights up on problems)'),
         ('F10', 'quit (asks to confirm)'),
@@ -2962,16 +2961,27 @@ class UiMixin:
         elif k == '\t':
             self.focus = 'side'
         elif k in ('\x1b', curses.KEY_UP):
-            self.focus = 'input'
+            self.focus = 'side'
         elif k == '\n':
             await self.handle_key(getattr(curses, 'KEY_' + self.FKEYS[self.fsel]))
+        elif isinstance(k, str) and k.isprintable():
+            pass
         elif isinstance(k, str) and not (len(k) == 1 and ord(k) in (CTRL_Q, CTRL_C)):
-            self.focus = 'input'              # typing starts a message
             return False
         else:
             return False
         self.dirty = True
         return True
+
+    def can_chat(self) -> bool:
+        """True when the selected item takes typed messages: a channel or a chat contact."""
+        key = self.selected
+        if not key or key in (RX_KEY, LOG_KEY):
+            return False
+        if key[0] == 'c':
+            return True
+        c = self.selected_contact()
+        return c is not None and c.get('type', 1) == 1
 
     def handle_side_key(self, k) -> bool:
         """Keys while the list on the left has focus; returns False to fall through to the input."""
@@ -2984,21 +2994,21 @@ class UiMixin:
         elif k == curses.KEY_NPAGE:
             self.scroll = max(0, self.scroll - 5)
         elif k == '\n':
-            self.open_contact_menu()
-        elif k == '\t':
-            self.focus = 'input'
-        elif k == curses.KEY_RIGHT:           # like Tab from the input: to the messages, if there are any
+            if self.can_chat():
+                self.focus = 'input'          # the prompt is only active after an explicit Enter
+            else:
+                self.open_contact_menu()      # repeaters, rooms, Log, Radio: nothing to type yet
+        elif k in ('\t', curses.KEY_RIGHT):  # to the messages, if there are any, else on to the function keys
             if self.history.get(self.selected):
                 self.focus = 'msgs'
                 self.msg_sel = len(self.history[self.selected]) - 1
-            else:
-                self.focus = 'input'
-        elif k == curses.KEY_LEFT:
+            elif k == '\t':
+                self.focus = 'fkeys'
+        elif k in (curses.KEY_LEFT, '\x1b'):
             pass
-        elif k == '\x1b':
-            pass
+        elif isinstance(k, str) and k.isprintable():
+            pass                              # typing does not start a message; press Enter for that
         elif isinstance(k, str) and not (len(k) == 1 and ord(k) in (CTRL_Q, CTRL_C)):
-            self.focus = 'input'              # typing from the list starts a message
             return False
         else:
             return False
@@ -3096,8 +3106,11 @@ class UiMixin:
         prompt = f'{self.name_for(self.selected)[:14]}# ' if cli == 'on' else '> '
         vis = w - len(prompt) - 1
         start = max(0, self.pos - vis + 1)
-        if self.focus == 'side' and not self.buf:
-            scr.addnstr(h - 2, 0, 'Enter: menu · Tab: write a message · type to start one', w - 1, curses.A_DIM)
+        if self.focus != 'input' and not self.buf:
+            hint = {'msgs': 'Enter: details · Left: list · Tab: function keys',
+                    'fkeys': 'Enter: press the highlighted key · Esc: back'}.get(
+                self.focus, 'Enter: write a message · F7: menu' if self.can_chat() else 'Enter: menu')
+            scr.addnstr(h - 2, 0, hint, w - 1, curses.A_DIM)
         else:
             scr.addnstr(h - 2, 0, prompt + self.buf[start:start + vis], w - 1)
             if not self.buf and cli:
@@ -3344,7 +3357,7 @@ class App(ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMixin, Channel
     def select(self, key: tuple):
         self.selected = key
         if self.focus == 'msgs':
-            self.focus = 'input'
+            self.focus = 'side'
         self.unread.pop(key, None)
         self.scroll = 0
         self.dirty = True

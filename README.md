@@ -63,9 +63,11 @@ Marks after your own messages: ` ·` handed to the radio, ` ✓` delivered (priv
 heard being repeated by at least one repeater (channel message), ` ✗` failed. Select a message and press
 Enter to see the details, including how many repeats were heard and through which repeaters.
 
-Keys: Tab goes list > input > messages > function-key bar > list. Left/Right switch between the list and the
-messages; on the function-key bar they pick a key (highlighted) and Enter presses it, so the F-keys are usable
-without reaching for the tiny Fn row. Esc steps back to the input line.
+Keys: the arrow keys always navigate; the `>` prompt only becomes active when you press Enter on a channel or
+chat contact (Enter on a repeater, room, Log or Radio opens its menu instead, F7 opens the menu from anywhere).
+Esc goes back to the list. Tab goes list > messages > function-key bar > list. Left/Right switch between the
+list and the messages; on the function-key bar they pick a key (highlighted) and Enter presses it, so the F-keys
+are usable without reaching for the tiny Fn row. Typing in the list, the messages or the key bar does nothing.
 
 `/connect` reconnects, `/disconnect` stops the radio, F3 toggles. Chat history and UI settings are in
 `~/.config/cardputer-mc/`.
