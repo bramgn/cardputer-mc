@@ -65,10 +65,10 @@ Enter to see the details, including how many repeats were heard and through whic
 
 Keys: the arrow keys always navigate; the `>` prompt only becomes active when you press Enter on a channel or
 chat contact (Enter on a repeater, room, Log or Radio opens its menu instead, F6 opens Actions for the selected item from anywhere).
-Esc goes back one step, to where you came from (input, messages or key bar to the list). Tab goes list > messages
+Esc goes back one step, to where you came from (input, messages or key bar to the list); a question or window opened from Options or the Actions menu goes back to that menu (Options > Send advert > Esc is Options again). Tab goes list > messages
 > each key of the function-key bar in turn > list. The headings in the list (Channels, Contacts, Repeaters,
 Console) take the cursor too: Enter (or Left/Right) folds and unfolds them, so 350 contacts can be put away; a
-folded heading still shows the unread count, and the choice is remembered. Left/Right switch between the
+folded heading still shows the unread count, and the choice is remembered. `F6` (Actions) with the cursor on a heading opens a menu for the whole group: Contacts has *Sort* (newest advert, name A-Z, last message; favorites always first), *Favorites only*, *Show repeaters* and *Remove stale contacts...* (asks for a number of days, then for a yes; favorites and contacts you have talked to are kept), Channels has *Add channel...*, Console has *Clear Log* and *Clear Radio packets*, every group has *Mark all read*, and each has Fold / Unfold. Favorites are shown in yellow. Left/Right switch between the
 list and the messages; on the function-key bar they pick a key (highlighted) and Enter presses it, so the F-keys
 are usable without reaching for the tiny Fn row. Typing in the list, the messages or the key bar does nothing.
 
@@ -97,7 +97,7 @@ On a small screen (under about 60 columns) the title bar shows just the conversa
 CardputerZero itself (`58%+`, the plus means charging) and the connection state; messages drop their `HH:MM`
 prefix (Enter shows the time in the details); and the function-key bar is five slots,
 each centred above the keyboard key that presses it (`Fn`+4 to 8, the five keys that sit fully under the
-screen: Help, Options, Actions, Log, Quit; Tab and Enter work too). A wide terminal shows the key names
+screen: Help, Options, Actions, Advert, Quit; Tab and Enter work too). A wide terminal shows the key names
 (`F4 Help`). `F1`/`F2`/`F10` still work as before, `F3` connects or disconnects, `F9` shows the radio log.
 
 The list on the left takes a quarter of the width (10 to 24 columns): a wide terminal keeps the full list, the

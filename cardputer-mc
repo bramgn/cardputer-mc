@@ -236,6 +236,75 @@ index 08e6683..505dd49 100644
      def __str__(self):
          return super().__str__() + f"Ackhash: {hexlify(self.ackhash).decode()}\n"
 '''
+
+PI_PATCH_TX = r'''diff --git a/companionradio.py b/companionradio.py
+index 33c58d5..b79dbcf 100644
+--- a/companionradio.py
++++ b/companionradio.py
+@@ -792,7 +792,7 @@ class CompanionRadio(BasicMesh):
+             elif command == CMD_SET_RADIO_TX_POWER:
+                 logger.debug(f"CMD_SET_RADIO_TX_POWER, {hexlify(frame[1:]).decode()}")
+ 
+-                # FIXME - don't just ignore this
++                self.dispatch.set_txpower(int.from_bytes(frame[1:5], "little", signed=True))
+                 response = OK
+ 
+ 
+diff --git a/dispatch.py b/dispatch.py
+index f9d1e9f..3ce2367 100644
+--- a/dispatch.py
++++ b/dispatch.py
+@@ -283,6 +283,11 @@ class Dispatch:
+             # to the airtime total
+             self.airtime += max(tx_times) / 1000    # Airtime from interfaces is in ms
+ 
++    def set_txpower(self, dbm):
++        for i in self.interfaces:
++            if hasattr(i, "set_txpower"):
++                i.set_txpower(dbm)
++
+     # Get the current radio configuration from the best interface (ie, a LoRa one, if present)
+     # in order to pass it to the app
+     def get_radioconfig(self):
+diff --git a/interfaces/lorainterface.py b/interfaces/lorainterface.py
+index 4ad7d03..a45cf82 100644
+--- a/interfaces/lorainterface.py
++++ b/interfaces/lorainterface.py
+@@ -73,6 +73,7 @@ class LoRaInterface(Interface):
+         self.bw = config.get("bw")
+         self.cr = config.get("cr")
+         self.txpower = config.get("txpower")
++        self.txpower_applied = self.txpower      # what the chip is set to; set_txpower() changes txpower, transmit() applies it
+         airtime = config.get("airtime", 10)
+ 
+         spi = config.get("spi")
+@@ -225,6 +226,12 @@ class LoRaInterface(Interface):
+         self.txdone.clear()
+         self.txtime = 0
+ 
++        if self.txpower != self.txpower_applied:     # changed by CMD_SET_RADIO_TX_POWER: apply it between packets
++            self.LoRa.setStandby(self.LoRa.STANDBY_RC)
++            self.LoRa.setTxPower(self.txpower)
++            self.txpower_applied = self.txpower
++            logger.info(f"TX power set to {self.txpower} dBm")
++
+         self.LoRa.beginPacket()
+         self.LoRa.put(packetdata)
+         self.LoRa.endPacket()
+@@ -245,8 +252,11 @@ class LoRaInterface(Interface):
+ 
+     # Return a tuple containing frequency (kHz), bandwidth (Hz), spreading factor, coding rate,
+     # tx power (dBm), maximum tx power (dBm)
++    def set_txpower(self, dbm):
++        self.txpower = max(-9, min(22, int(dbm)))     # the SX1262 range
++
+     def get_radioconfig(self):
+-        return (self.freq//1000, self.bw, self.sf, self.cr, self.txpower, 27)
++        return (self.freq//1000, self.bw, self.sf, self.cr, self.txpower, 22)
+ 
+     async def start(self):
+         self.eventloop = asyncio.get_running_loop()
+'''
 APT_PACKAGES = ['git', 'python3-venv', 'python3-rpi-lgpio', 'python3-lgpio']
 PIP_PACKAGES = ['meshcore', 'pycryptodome', 'aiotools', 'pyserial_asyncio', 'typing-extensions', 'LoRaRF']
 
@@ -368,7 +437,8 @@ def install(argv):
         _run(['git', 'clone', '-q', PI_REPO, PI_DIR])
     _run(['git', '-C', PI_DIR, 'checkout', '-q', PI_COMMIT])
     # local fixes: MeshCore >= 1.11 multi-byte path hashes, and a receive race in the LoRa driver loop
-    for name, patch in (('multi-byte path hashes, RX race', PI_PATCH), ('ACKs with extra bytes', PI_PATCH_ACK)):
+    for name, patch in (('multi-byte path hashes, RX race', PI_PATCH), ('ACKs with extra bytes', PI_PATCH_ACK),
+                        ('TX power command (applied between packets, max 22)', PI_PATCH_TX)):
         if subprocess.run(['git', '-C', PI_DIR, 'apply', '--check', '-R', '-'], input=patch, text=True,
                           capture_output=True).returncode == 0:
             print(f'  fix already applied: {name}')
@@ -664,6 +734,7 @@ SIDEBAR_W = 24               # the list's width on a roomy terminal
 MIN_SIDEBAR_W = 10           # ... and the least it shrinks to on a small one
 TIME_MIN_WIDTH = 44          # messages show their time (HH:MM) from this width; below it only the details window does
 MAX_CHANNELS = 8
+TX_POWER_MIN, TX_POWER_MAX = 0, 22       # dBm: the SX1262 reaches 22 (and -9, but the meshcore library cannot send negative values)
 NODE_TYPES = {1: 'client', 2: 'repeater', 3: 'room'}
 CTRL_Q, CTRL_C = 17, 3
 LOG_LINES = 1000
@@ -775,6 +846,7 @@ theme_REV = curses.A_REVERSE                   # bars and popups
 theme_SEL = curses.A_REVERSE | curses.A_BOLD   # highlighted row
 theme_HEAD = curses.A_BOLD | curses.A_UNDERLINE
 theme_UNREAD = curses.A_BOLD
+theme_FAV = curses.A_BOLD                     # favourite contacts in the list (yellow when there are colours)
 theme_ME = curses.A_DIM
 theme_NOTE = curses.A_DIM
 theme_FAIL = curses.A_BOLD
@@ -859,7 +931,7 @@ theme_DESCRIPTIONS = {
 
 
 def theme_init_colors(theme: str = 'blue'):
-    global theme_REV, theme_SEL, theme_HEAD, theme_UNREAD, theme_ME, theme_NOTE, theme_FAIL, theme_GOOD_BAR, theme_BAD_BAR
+    global theme_FAV, theme_REV, theme_SEL, theme_HEAD, theme_UNREAD, theme_ME, theme_NOTE, theme_FAIL, theme_GOOD_BAR, theme_BAD_BAR
     pairs = theme_THEMES.get(theme)
     if pairs is None or not curses.has_colors():
         theme_REV, theme_SEL, theme_HEAD = curses.A_REVERSE, curses.A_REVERSE | curses.A_BOLD, curses.A_BOLD | curses.A_UNDERLINE
@@ -870,6 +942,8 @@ def theme_init_colors(theme: str = 'blue'):
     curses.use_default_colors()
     for n, (fg, bg) in enumerate(pairs, 1):
         curses.init_pair(n, theme_col(fg), theme_col(bg))
+    curses.init_pair(10, theme_col('yellow'), theme_col('default'))
+    theme_FAV = curses.color_pair(10)
     theme_REV = curses.color_pair(1)
     theme_SEL = curses.color_pair(2) | curses.A_BOLD
     theme_HEAD = curses.color_pair(3) | curses.A_BOLD
@@ -2285,11 +2359,21 @@ class SettingsMixin:
             return
         self.set_theme(hits[0])
 
+    def restore(self, back):
+        """Esc on a popup that was opened from Options or from the Actions menu: go back to that one."""
+        if back == 'options':
+            self.settings_open = True
+        elif back and back[0] == 'cmenu':
+            self.cmenu_open, self.cmenu_sel = True, back[1]
+        self.dirty = True
+
     async def apply_setting(self, which: str, text: str | None = None):
         if which == 'info':
             if self.need_radio():
                 self.settings_open = False
+                self.menu_origin = 'options'              # Esc on the info window comes back here
                 await self.radio_info()
+                self.menu_origin = None
             return
         if which == 'clock':
             if self.need_radio():
@@ -2298,9 +2382,12 @@ class SettingsMixin:
         if which == 'reboot':
             self.settings_open = False
             self.ask_reboot()
+            if self.confirm_remove:
+                self.confirm_remove['back'] = 'options'
             return
         if which == 'advert':
             self.settings_open = False
+            self.advert_back = 'options' if self.mc else None
             await self.advert()
             return
         if which == 'repeaters':
@@ -2345,6 +2432,9 @@ class SettingsMixin:
                 dbm = int(text)
             except ValueError:
                 self.status = 'TX power must be a number'
+                return
+            if not TX_POWER_MIN <= dbm <= TX_POWER_MAX:
+                self.status = f'TX power must be {TX_POWER_MIN} to {TX_POWER_MAX} dBm (the SX1262 cannot do more)'
                 return
             r = await cmds.set_tx_power(dbm)
             ok_val = ('tx_power', dbm)
@@ -2413,12 +2503,15 @@ class SettingsMixin:
     async def handle_advert_key(self, k):
         if k == '\x1b':
             self.advert_menu_open = False
+            back, self.advert_back = self.advert_back, None
+            self.restore(back)
         elif k == curses.KEY_UP:
             self.advert_sel = 0
         elif k == curses.KEY_DOWN:
             self.advert_sel = len(self.ADVERT_CHOICES) - 1
         elif k == '\n':
             self.advert_menu_open = False
+            self.advert_back = None
             await self.advert(self.ADVERT_CHOICES[self.advert_sel][1])
         elif isinstance(k, str) and len(k) == 1 and ord(k) in (CTRL_Q, CTRL_C):
             self.quit = True
@@ -2441,17 +2534,20 @@ class SettingsMixin:
     def draw_settings(self, scr, h, w):
         rows = self.setting_rows()
         bw = min(w - 2, 58)
-        bh = len(rows) + 4
+        vis = max(1, min(len(rows), h - 4))                       # more settings than screen rows: scroll
+        off = max(0, min(self.set_sel - vis // 2, len(rows) - vis))
+        bh = vis + 4
         y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
-        for y in range(bh):
+        for y in range(min(bh, h - y0)):
             scr.addstr(y0 + y, x0, blank(bw), theme_REV)
-        scr.addnstr(y0, x0 + 1, 'Options', bw - 2, theme_REV | curses.A_BOLD)
-        for i, (label, val) in enumerate(rows):
+        scr.addnstr(y0, x0 + 1, 'Options' + (' (more: ↑/↓)' if vis < len(rows) else ''), bw - 2, theme_REV | curses.A_BOLD)
+        for i in range(off, off + vis):
+            label, val = rows[i]
             if i == self.set_sel and self.set_edit is not None:
                 val = self.set_edit + '_'
             line = f'{label:<31}{val}'
             attr = theme_SEL if i == self.set_sel else theme_REV
-            scr.addnstr(y0 + 1 + i, x0 + 1, pad(line, bw - 2), bw - 2, attr)
+            scr.addnstr(y0 + 1 + i - off, x0 + 1, pad(line, bw - 2), bw - 2, attr)
         hint = 'Enter save · Esc cancel' if self.set_edit is not None else \
             ('←/→ theme · ' if self.SETTINGS[self.set_sel] == 'theme' else '') + 'Enter change · Esc close'
         scr.addnstr(y0 + bh - 1, x0 + 1, hint, bw - 2, theme_REV | curses.A_DIM)
@@ -2501,7 +2597,56 @@ class ContactsMixin:
         ('Reset path', 'resetpath'), ('Remove contact', 'remove'),
     )
 
+    def group_actions(self, name: str) -> tuple:
+        fold = ('Unfold' if name in self.collapsed else 'Fold', 'fold')
+        rep_toggle = (f'Show repeaters: {"on" if self.show_repeaters else "off"}', 'repeaters')
+        read = ('Mark all read', 'markread')
+        if name == 'Channels':
+            return (('Add channel...', 'newchan'), read, fold)
+        if name == 'Contacts':
+            return ((f'Sort: {self.SORTS[self.contact_sort]}', 'sort'),
+                    (f'Favorites only: {"on" if self.fav_only else "off"}', 'favonly'), rep_toggle, read,
+                    ('Remove stale contacts...', 'stale'), fold)
+        if name == 'Repeaters':
+            return (rep_toggle, read, fold)
+        return (('Clear Log', 'clearlog'), ('Clear Radio packets', 'clearrx'), read, fold)
+
+    async def group_action(self, name: str, action: str):
+        if action == 'fold':
+            self.toggle_group(name)
+        elif action == 'sort':
+            names = list(self.SORTS)
+            self.contact_sort = names[(names.index(self.contact_sort) + 1) % len(names)]
+            self.save_config()
+            self.status = f'contacts sorted by {self.SORTS[self.contact_sort]} (favorites first)'
+        elif action == 'markread':
+            keys = [k for k, _ in self.groups().get(name, [])]
+            n = sum(1 for k in keys if self.unread.pop(k, 0))
+            self.status = f'{n} marked read' if n else 'nothing unread'
+        elif action == 'stale':
+            self.ask = {'label': 'Remove contacts (and repeaters) not heard for how many days?', 'text': '30',
+                        'cb': lambda text, _c: self.ask_stale(text), 'contact': None}
+        elif action == 'favonly':
+            self.fav_only = not self.fav_only
+            self.save_config()
+            self.status = 'contacts: favorites only' if self.fav_only else 'contacts: all'
+        elif action == 'repeaters':
+            self.show_repeaters = not self.show_repeaters
+            self.status = f'repeaters in the list: {"on" if self.show_repeaters else "off"}'
+        elif action == 'newchan':
+            if self.need_radio():
+                self.ask = {'label': 'New channel: name [secret-hex]  (#name = public hashtag channel)', 'text': '',
+                            'cb': lambda text, _c: self.create_channel(text), 'contact': None}
+        elif action in ('clearlog', 'clearrx'):
+            key = LOG_KEY if action == 'clearlog' else RX_KEY
+            self.history[key] = []
+            self.unread.pop(key, None)
+            self.status = 'Log cleared' if action == 'clearlog' else 'Radio packets cleared'
+        self.dirty = True
+
     def menu_actions(self) -> tuple:
+        if self.group_menu:
+            return self.group_actions(self.group_menu)
         key = self.selected or ('x',)
         if key[0] == 'c':
             return self.chan_actions(key)
@@ -2554,7 +2699,11 @@ class ContactsMixin:
     def open_contact_menu(self):
         """Context menu for whatever is selected in the list: channel, contact, Log or Radio."""
         key = self.selected
-        if key is None:
+        head = self.cursor_header() if self.focus == 'side' else None
+        self.group_menu = head[1] if head else None
+        if head:                                      # the cursor rests on a heading: actions for that group
+            self.cmenu_open, self.cmenu_sel = True, 0
+        elif key is None:
             self.status = 'nothing selected'
         elif key[0] == 'd' and self.selected_contact() is None:
             self.status = 'not in the contact list'
@@ -2842,6 +2991,44 @@ class ContactsMixin:
         self.status = (f'path set for {c.get("adv_name", "?")}' if r.type != EventType.ERROR
                        else f'set path failed: {describe_error(r.payload)}')
 
+    async def ask_stale(self, text: str):
+        """Contacts whose last advert is older than N days (never favourites, never one you have talked to) go after a yes."""
+        try:
+            days = int(text.strip())
+            if days < 1:
+                raise ValueError
+        except ValueError:
+            self.status = 'days must be a whole number, 1 or more'
+            return
+        if not self.need_radio():
+            return
+        cutoff = time.time() - days * 86400
+        stale = [c for c in self.contacts().values()
+                 if c.get('last_advert', 0) < cutoff and c['public_key'][:12] not in self.favorites
+                 and ('d', c['public_key'][:12]) not in self.history]
+        if not stale:
+            self.status = f'no contacts older than {days} days (favorites and chats are kept)'
+            return
+        self.confirm_remove = {'label': f'Remove {len(stale)} contact(s) not heard for {days}+ days',
+                               'run': lambda: self.apply_remove_many(stale)}
+        self.dirty = True
+
+    async def apply_remove_many(self, stale: list):
+        if not self.need_radio():
+            return
+        done = 0
+        for c in stale:
+            async with self.radio_lock:
+                r = await self.mc.commands.remove_contact(c['public_key'])
+            if r.type == EventType.ERROR:
+                self.status = f'removed {done} of {len(stale)}; stopped: {describe_error(r.payload)}'
+                break
+            self.mc.contacts.pop(c['public_key'], None)
+            done += 1
+        else:
+            self.status = f'removed {done} contact(s)'
+        self.dirty = True
+
     async def apply_remove(self, c: dict):
         if not self.need_radio():
             return
@@ -2868,9 +3055,15 @@ class ContactsMixin:
             self.cmenu_sel = 0 if k == curses.KEY_HOME else n - 1
         elif k == '\n':
             act = self.menu_actions()[self.cmenu_sel][1]
-            self.cmenu_open = act in ('notify', 'keep')      # settings that cycle keep the menu open
-            self.menu_origin = (self.selected, self.cmenu_sel) if act in self.WINDOW_ACTIONS else None
-            await self.item_action(act)
+            self.cmenu_open = act in ('notify', 'keep', 'favonly', 'repeaters', 'sort')      # settings that cycle keep the menu open
+            self.menu_origin = (self.selected, self.cmenu_sel) if act in self.WINDOW_ACTIONS and not self.group_menu else None
+            if self.group_menu:
+                await self.group_action(self.group_menu, act)
+            else:
+                await self.item_action(act)
+            popup = self.ask or self.confirm_remove
+            if popup is not None and 'back' not in popup:    # a question opened by the action: Esc returns to the menu
+                popup['back'] = ('cmenu', self.cmenu_sel)
             if self.menu_task is None:                       # no window coming: forget the way back
                 self.menu_origin = None
         elif isinstance(k, str) and len(k) == 1 and ord(k) in (CTRL_Q, CTRL_C):
@@ -2881,6 +3074,7 @@ class ContactsMixin:
         a = self.ask
         if k == '\x1b':
             self.ask = None
+            self.restore(a.get('back'))
         elif k == '\n':
             self.ask = None
             await a['cb'](a['text'], a['contact'])
@@ -2901,7 +3095,7 @@ class ContactsMixin:
         y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
         for y in range(bh):
             scr.addstr(y0 + y, x0, blank(bw), theme_REV)
-        scr.addnstr(y0, x0 + 1, 'Actions: ' + self.name_for(self.selected), bw - 2, theme_REV | curses.A_BOLD)
+        scr.addnstr(y0, x0 + 1, 'Actions: ' + (self.group_menu or self.name_for(self.selected)), bw - 2, theme_REV | curses.A_BOLD)
         for i, (label, _) in enumerate(acts[off:off + vis], off):
             attr = theme_SEL if i == self.cmenu_sel else theme_REV
             scr.addnstr(y0 + 1 + i - off, x0 + 1, pad(label, bw - 2), bw - 2, attr)
@@ -3074,15 +3268,15 @@ class CommandsMixin:
         ('h j k l', 'the same, Vim style; G = end, gg = top, Ctrl-D / Ctrl-U = half page down / up'),
         ('PgUp / PgDn', 'scroll history'),
         ('Enter', 'in the list: write a message (channels, contacts), open the actions (repeaters, Log, Radio) or fold / unfold a heading (Channels, Contacts, ...); in the input: send'),
-        ('F6', 'Actions for the selected item (ping, trace, set path...), from anywhere'),
-        ('Tab', 'list > messages > each key of the bar in turn > list (messages: Up/Down, Enter = details, r = resend)'),
+        ('F6', 'Actions for the selected item (ping, trace, set path...), from anywhere; with the cursor on a heading: for the whole group (sort, favorites only, stale contacts, mark all read, add channel...)'),
+        ('Tab', 'each heading of the list (Channels, Contacts, Console) > messages > each key of the bar > first heading (messages: Up/Down, Enter = details, r = resend)'),
         ('Left / Right', 'list <-> messages; on the function keys: pick one, Enter presses it'),
         ('Esc', 'one step back: from the input, the messages or the function keys to where you came from (usually the list)'),
         ('Space, / or :', 'start typing from anywhere; / or : starts a command, so /q or :q always quits'),
-        ('F4', 'this help (also F1). The bar on the bottom row sits above the keys 4 to 8: press Fn + the key under a label'),
+        ('F4', 'this help (also F1). The bar sits above the keys 4 to 8: press the key under a label (Fn + it, or just the digit when you are not typing)'),
         ('F5', 'options (name, TX power, advert, theme, ...) (also F2)'),
         ('F6', 'actions for the selected item (see above)'),
-        ('F7', 'Log: status messages (lights up on problems)'),
+        ('F7', 'send an advert (zero hop or flood). The Log (status messages, lights up on problems) is in the list on the left, or /log'),
         ('F8', 'quit (asks to confirm) (also F10)'),
         ('F3', 'choose device and connect / disconnect'),
         ('F9', 'Radio: every packet heard (Tab: select, Enter = details)'),
@@ -3107,7 +3301,7 @@ class CommandsMixin:
         ('/disconnect  /d', 'disconnect from the radio'),
         ('/advert  /a', 'advert menu, or /advert zero|flood'),
         ('/clear', 'empty the selected conversation (Log, Radio, channel or chat)'),
-        ('/log  /console', 'show the Log (F7)'),
+        ('/log  /console', 'show the Log'),
         ('/radio  /rxlog', 'show the Radio packet list (F9)'),
         ('/search  /f', 'search all messages: /search <text>'),
         ('/trace  /t', 'trace hops: /trace 78,64,78 or repeater names'),
@@ -3208,7 +3402,9 @@ class UiMixin:
                 return
             self.details = None
             back, self.details_back = self.details_back, None
-            if back and self.selected == back[0]:        # one step back: the menu the window came from
+            if back == 'options':                        # one step back: Options, or the Actions menu the window came from
+                self.settings_open = True
+            elif back and self.selected == back[0]:
                 self.cmenu_open, self.cmenu_sel = True, back[1]
             return
         if self.help_open:
@@ -3236,7 +3432,10 @@ class UiMixin:
                 run, self.confirm_remove = self.confirm_remove['run'], None
                 await run()
             elif k in ('n', 'N', '\x1b', '\n'):
+                back = self.confirm_remove.get('back')
                 self.confirm_remove = None
+                if k != '\n':
+                    self.restore(back)
             self.dirty = True
             return
         if self.search:
@@ -3248,6 +3447,9 @@ class UiMixin:
         if self.advert_menu_open:
             await self.handle_advert_key(k)
             return
+        if (isinstance(k, str) and k in ('4', '5', '6', '7', '8') and self.focus != 'input' and not self.settings_open
+                and not self.buf):                               # the keys under the screen, without Fn, when not typing
+            k = (curses.KEY_F4, curses.KEY_F5, curses.KEY_F6, curses.KEY_F7, curses.KEY_F8)[int(k) - 4]
         if k in (curses.KEY_F8, curses.KEY_F10):                  # Quit
             self.confirm_quit = True
             self.dirty = True
@@ -3260,8 +3462,13 @@ class UiMixin:
             self.help_open, self.help_scroll = True, 0
             self.dirty = True
             return
-        if k in (curses.KEY_F7, curses.KEY_F9):                   # Log, Radio (RX log)
-            self.select(LOG_KEY if k == curses.KEY_F7 else RX_KEY)
+        if k == curses.KEY_F7 and not self.settings_open:         # Advert (Log: the list on the left, or /log)
+            self.advert_back = None
+            await self.advert()
+            self.dirty = True
+            return
+        if k == curses.KEY_F9:                                    # Radio (RX log)
+            self.select(RX_KEY)
             return
         if k in (curses.KEY_F5, curses.KEY_F2) and not self.settings_open:   # Opts
             self.settings_open = True
@@ -3297,6 +3504,8 @@ class UiMixin:
                 if self.pos:
                     self.buf = self.buf[:self.pos - 1] + self.buf[self.pos:]
                     self.pos -= 1
+                elif not self.buf and self.focus == 'input':      # nothing left to delete: leave the input
+                    self.focus_back()
             elif o == 1:                       # ^A  home
                 self.pos = 0
             elif o == 5:                       # ^E  end
@@ -3346,6 +3555,8 @@ class UiMixin:
             if self.pos:
                 self.buf = self.buf[:self.pos - 1] + self.buf[self.pos:]
                 self.pos -= 1
+            elif not self.buf and self.focus == 'input':          # nothing left to delete: leave the input
+                self.focus_back()
         elif k == curses.KEY_DC:
             self.buf = self.buf[:self.pos] + self.buf[self.pos + 1:]
         elif k == curses.KEY_F3:
@@ -3364,8 +3575,11 @@ class UiMixin:
         elif k == '\t':                       # on through every slot of the bar, then back to the list
             if self.fsel < n - 1:
                 self.fsel += 1
-            else:
+            else:                                  # and round to the first heading of the list
                 self.focus = 'side'
+                heads = [k for _, k, _ in self.side_rows() if k[0] == 'h']
+                if heads:
+                    self.goto(heads[0])
         elif k in ('\x1b', curses.KEY_UP):
             self.focus_back()
         elif k == '\n':
@@ -3431,6 +3645,8 @@ class UiMixin:
                 self.focus = 'input'          # the prompt is only active after an explicit Enter
             else:
                 self.open_contact_menu()      # repeaters, rooms, Log, Radio: nothing to type yet
+        elif k == '\t' and self.next_heading():
+            pass
         elif k in ('\t', curses.KEY_RIGHT):  # to the messages, if there are any, else on to the function keys
             if self.history.get(self.selected):
                 self.focus = 'msgs'
@@ -3453,14 +3669,14 @@ class UiMixin:
         self.dirty = True
         return True
 
-    BAR = (('Help', 'Help'), ('Options', 'Opts'), ('Actions', 'Act'), ('Log', 'Log'), ('Quit', 'Quit'))
+    BAR = (('Help', 'Help'), ('Options', 'Opts'), ('Actions', 'Act'), ('Advert', 'Adv'), ('Quit', 'Quit'))
 
     def fkey_slots(self, w: int) -> list[tuple[int, int, str]]:
         """The function-key bar as (x, width, text). The built-in keyboard has five keys (4 to 8) fully under
         the screen, so the bar is five slots in a row, each name centred over its key; Fn+4 ... Fn+8 press them.
         A wide terminal gets wider slots and the key name too ('F4 Help')."""
         slot = max(5, min(w // 5, 8 if w < 70 else 14))
-        x0 = max(0, (w - 5 * slot) // 2)
+        x0 = max(0, (w - 5 * slot) // 2) + 1          # one column right of centre: that is where the keys sit
         out = []
         for i, (long, short) in enumerate(self.BAR):
             name = f'{self.FKEYS[i]} {long}' if slot >= 11 else (short if slot < 8 else long)
@@ -3491,21 +3707,22 @@ class UiMixin:
         # sidebar
         rows = self.side_rows()
         keys = [k for _, k, _ in rows]
-        cur = self.cursor_header() or self.selected
+        cur = self.list_cursor(keys)
         sel_row = keys.index(cur) if cur in keys else 0
         top = max(0, min(sel_row - body_h // 2, len(rows) - body_h))
         for y, (label, key, u) in enumerate(rows[top:top + body_h]):
             tail = f' {u}' if u else ''
             lead = '' if key[0] == 'h' else ' '
+            fav = key[0] == 'd' and key[1] in self.favorites
             text = pad(lead + label[:sw - 1 - len(tail) - 2 * len(lead)], sw - 1 - len(tail)) + tail
-            if key == cur:
-                attr = theme_SEL
+            if key == cur and self.focus == 'side':
+                attr = theme_SEL                     # the cursor, only while the list has the focus
             elif key[0] == 'h':
                 attr = theme_HEAD | (curses.A_BOLD if u else 0)
-            elif key == self.selected and self.cursor_header():
-                attr = curses.A_BOLD                 # the open conversation while the cursor rests on a heading
+            elif key == self.selected:
+                attr = curses.A_BOLD | (theme_FAV if fav else 0)       # the open conversation, when the cursor is elsewhere
             else:
-                attr = theme_UNREAD if u else curses.A_NORMAL
+                attr = theme_UNREAD if u else (theme_FAV if fav else curses.A_NORMAL)
             scr.addnstr(1 + y, 0, text, sw - 1, attr)
             if key == self.selected:
                 self.side_row = (key, 1 + y)
@@ -3654,7 +3871,7 @@ class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMi
     def save_config(self):
         cfg = {'show_repeaters': self._show_repeaters, 'auto_connect': self.auto_connect,
                'keep_daemon': self.keep_daemon, 'theme': self.theme, 'favorites': sorted(self.favorites), 'channels': self.chan_prefs, 'retries': self.retries,
-               'collapsed': sorted(self.collapsed)}
+               'collapsed': sorted(self.collapsed), 'fav_only': self.fav_only, 'contact_sort': self.contact_sort}
         try:
             os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
             with open(CONFIG_FILE, 'w') as f:
@@ -3719,7 +3936,7 @@ class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMi
         self.unread: dict[tuple, int] = {}
         self.selected: tuple | None = None
         cfg = load_config()
-        self._show_repeaters = bool(cfg.get('show_repeaters', False))
+        self._show_repeaters = bool(cfg.get('show_repeaters', True))
         self.auto_connect = bool(cfg.get('auto_connect', True))
         self.keep_daemon = bool(cfg.get('keep_daemon', False))     # keep the radio on when the last window closes
         self.favorites: set[str] = set(cfg.get('favorites', []))     # contact key prefixes (12 hex)
@@ -3739,6 +3956,9 @@ class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMi
         self.focus_trail: list[str] = []
         self.cursor: tuple | None = None     # a heading (Channels, Contacts, ...) the list cursor is on, else None
         self.collapsed: set[str] = set(cfg.get('collapsed', []))
+        self.fav_only = bool(cfg.get('fav_only', False))      # Contacts: only favourites (and what has unread / is open)
+        self.contact_sort = cfg.get('contact_sort') if cfg.get('contact_sort') in self.SORTS else 'advert'
+        self.group_menu: str | None = None   # the heading the Actions menu is open for, else None (the open conversation)
         self.focus = 'side'                  # 'side' (list) | 'input' | 'msgs' | 'fkeys' (function key bar)
         self.fsel = 0                        # highlighted entry of the function key bar
         self.keepalive_task: asyncio.Task | None = None
@@ -3760,6 +3980,7 @@ class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMi
         self.cmenu_open = False
         self.cmenu_sel = 0
         self.advert_menu_open = False
+        self.advert_back = None                  # where Esc on the advert menu goes back to ('options')
         self.advert_sel = 0
         self.ask: dict | None = None         # single-line input prompt: label/text/cb
         self.confirm_remove: dict | None = None
@@ -3780,13 +4001,21 @@ class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMi
             self.on_log_record(rec)
         LOG.records.clear()
 
+    SORTS = {'advert': 'newest advert', 'name': 'name A-Z', 'message': 'last message'}
+
     def contact_entries(self) -> list[tuple[tuple, str]]:
         """People first, then repeaters and room servers; each newest first (favourites on top)."""
         out, infra = [], []
         known = set()
-        contacts = sorted(self.contacts().values(),
-                          key=lambda c: (c['public_key'][:12] not in self.favorites,
-                                         -c.get('last_advert', 0)))
+        def order(c):                                  # favourites first, then by the chosen sort
+            fav = c['public_key'][:12] not in self.favorites
+            if self.contact_sort == 'name':
+                return (fav, (c.get('adv_name') or c['public_key']).lower())
+            if self.contact_sort == 'message':
+                msgs = self.history.get(('d', c['public_key'][:12]))
+                return (fav, -((msgs[-1].recv or msgs[-1].ts) if msgs else 0), -c.get('last_advert', 0))
+            return (fav, -c.get('last_advert', 0))
+        contacts = sorted(self.contacts().values(), key=order)
         for c in contacts:
             key = ('d', c['public_key'][:12])
             known.add(key)
@@ -3795,8 +4024,9 @@ class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMi
             fav = key[1] in self.favorites
             if is_rep and not self.show_repeaters and not fav and key not in self.history:
                 continue
-            tag = '★' if fav else ''
-            (infra if infra_node else out).append((key, tag + (c.get('adv_name') or c['public_key'][:8])))
+            if self.fav_only and not fav and key != self.selected and not self.unread.get(key):
+                continue
+            (infra if infra_node else out).append((key, c.get('adv_name') or c['public_key'][:8]))
         for key in self.history:
             if key and key[0] == 'd' and key not in known:
                 out.append((key, key[1][:8]))
@@ -3861,14 +4091,18 @@ class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMi
 
     GROUPS = ('Channels', 'Contacts', 'Repeaters', 'Console')
 
-    def side_rows(self) -> list[tuple[str, tuple, int]]:
-        """The visible rows of the list: (label, key, unread). Headings are ('h', name) keys; the cursor can sit on
-        them and Enter folds the group, so a long contact list can be put away."""
+    def groups(self) -> dict:
+        """The conversations of each list group: {'Channels': [(key, name)], 'Contacts': ..., 'Repeaters': ..., 'Console': ...}."""
         ents = self.entries()
         n_ch = len(self.channels)
         rest = ents[n_ch:-2]
-        groups = {'Channels': ents[:n_ch], 'Contacts': [(k, n) for k, n in rest if not self.is_infra(k)],
-                  'Repeaters': [(k, n) for k, n in rest if self.is_infra(k)], 'Console': ents[-2:]}
+        return {'Channels': ents[:n_ch], 'Contacts': [(k, n) for k, n in rest if not self.is_infra(k)],
+                'Repeaters': [(k, n) for k, n in rest if self.is_infra(k)], 'Console': ents[-2:]}
+
+    def side_rows(self) -> list[tuple[str, tuple, int]]:
+        """The visible rows of the list: (label, key, unread). Headings are ('h', name) keys; the cursor can sit on
+        them and Enter folds the group, so a long contact list can be put away."""
+        groups = self.groups()
         rows = []
         for name in self.GROUPS:
             items = groups[name]
@@ -3877,9 +4111,37 @@ class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMi
             if name in self.collapsed:
                 rows.append((f'+ {name}', ('h', name), sum(self.unread.get(k, 0) for k, _ in items)))
             else:
-                rows.append((f'- {name}', ('h', name), 0))
+                rows.append((f'- {name}' + (' (fav)' if name == 'Contacts' and self.fav_only else ''), ('h', name), 0))
                 rows += [(n, k, self.unread.get(k, 0)) for k, n in items]
         return rows
+
+    def group_of(self, key) -> str | None:
+        if key is None:
+            return None
+        if key[0] == 'c':
+            return 'Channels'
+        if key in (LOG_KEY, RX_KEY):
+            return 'Console'
+        return 'Repeaters' if self.is_infra(key) else 'Contacts'
+
+    def list_cursor(self, keys: list) -> tuple | None:
+        """The row the list cursor is on: a heading, the open conversation, or (when that sits in a folded group) the
+        heading of its group."""
+        cur = self.cursor_header() or self.selected
+        if cur not in keys:
+            grp = self.group_of(cur)
+            cur = ('h', grp) if ('h', grp) in keys else (keys[0] if keys else None)
+        return cur
+
+    def next_heading(self) -> bool:
+        """Tab in the list: on to the next heading below the cursor (Channels > Contacts > Console); False after the last."""
+        keys = [k for _, k, _ in self.side_rows()]
+        cur = self.list_cursor(keys)
+        for k in keys[keys.index(cur) + 1:] if cur in keys else keys:
+            if k[0] == 'h':
+                self.goto(k)
+                return True
+        return False
 
     def cursor_header(self) -> tuple | None:
         """The heading under the list cursor, if it is on one (and that heading is still there)."""
@@ -4020,6 +4282,23 @@ class _Client:
         self.writer.write(_wire(b'>', payload))
 
 
+def persist_txpower(dbm: int):
+    """Write the TX power into meshcore-pi's config, so it survives a restart of the radio."""
+    try:
+        with open(PI_CONFIG) as f:
+            text = f.read()
+        new, n = re.subn(r'(?m)^txpower\s*=.*$', f'txpower = {dbm}', text)
+        if n:
+            tmp = PI_CONFIG + '.tmp'
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w') as f:
+                f.write(new)
+            os.replace(tmp, PI_CONFIG)
+            log.info('TX power %d dBm saved in %s', dbm, PI_CONFIG)
+    except OSError as e:
+        log.warning('could not save the TX power: %s', e)
+
+
 class Daemon:
     def __init__(self, upstream=None):
         self.upstream = upstream              # (host, port) of a companion to use as is (tests); else run meshcore-pi
@@ -4123,8 +4402,11 @@ class Daemon:
                     client.send(client.queue.popleft() if client.queue else b'\x0a')
                     continue
                 async with self.lock:
-                    for frame in await self._request(payload):
+                    frames = await self._request(payload)
+                    for frame in frames:
                         client.send(frame)
+                    if payload[0] == 12 and frames and frames[0][0] == 0:      # TX power set: remember it for the next start
+                        await asyncio.to_thread(persist_txpower, int.from_bytes(payload[1:5], 'little', signed=True))
         except (asyncio.IncompleteReadError, ConnectionError, OSError):
             pass
         finally:
@@ -4629,6 +4911,31 @@ def run_cli(fn, a) -> int:
         return 130
 
 
+def terminfo_without_ech_rep():
+    """The CardputerZero's launcher terminal ignores two standard escape sequences, ECH (erase N characters) and REP
+    (repeat a character), which ncurses uses for runs of equal cells. Those cells then keep their old contents, so
+    popups come out garbled. Make a private copy of the terminal's entry without them (like screen/tmux have it)."""
+    term = os.environ.get('TERM', '')
+    if not term or term.endswith('-mc') or term.startswith(('screen', 'tmux', 'dumb', 'vt')):
+        return
+    tdir = os.path.join(HOME_DIR, 'terminfo')
+    name = term + '-mc'
+    if not os.path.exists(os.path.join(tdir, name[0], name)):
+        try:
+            src = subprocess.run(['infocmp', '-1', '-x', term], capture_output=True, text=True, timeout=10)
+            if src.returncode != 0:
+                return
+            lines = [l for l in src.stdout.splitlines() if not l.startswith('#') and not re.match(r'\s*(ech|rep)=', l)]
+            lines[0] = re.sub(r'^[^|,]*', name, lines[0], count=1)
+            os.makedirs(tdir, exist_ok=True)
+            subprocess.run(['tic', '-x', '-o', tdir, '-'], input='\n'.join(lines) + '\n', text=True,
+                           capture_output=True, timeout=10, check=True)
+        except (OSError, subprocess.SubprocessError, IndexError):
+            return                                   # no infocmp/tic: carry on with the terminal as it is
+    os.environ['TERMINFO'] = tdir
+    os.environ['TERM'] = name
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog=APP, description='ncurses MeshCore chat for the M5 CardputerZero with the Cap-LoRa-1262',
@@ -4695,10 +5002,11 @@ def main():
         logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s', datefmt='%H:%M:%S')
         up = os.environ.get('CARDPUTER_MC_UPSTREAM')      # host:port of a companion to use instead of meshcore-pi (tests)
         sys.exit(asyncio.run(Daemon((up.split(':')[0], int(up.split(':')[1])) if up else None).run()))
+    terminfo_without_ech_rep()
     args = argparse.Namespace()
     locale.setlocale(locale.LC_ALL, '')
     os.environ.setdefault('ESCDELAY', '25')   # ncurses waits 1000ms after Esc by default
-    # keep library log output off the screen; F7 shows it
+    # keep library log output off the screen; the Log entry shows it
     root = logging.getLogger()
     root.handlers[:] = [LOG]
     root.setLevel(logging.INFO)
