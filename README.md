@@ -102,12 +102,27 @@ built-in 45-column screen gives the messages 33 columns instead of 20.
 `/connect` reconnects, `/disconnect` stops the radio, F3 toggles. Chat history and UI settings are in
 `~/.config/cardputer-mc/`.
 
+## One radio, several windows
+
+The radio is owned by a small background process, the radio daemon (`cardputer-mc daemon`), that the chat starts by
+itself when it is not running. Any number of chat windows connect to it, for example the Cardputer's own CLI and an
+SSH session at the same time: each window has its own cursor and input line, they share the radio, the contacts and
+the message history (merged through `history.json`, so a message sent in one window shows up in the other within
+a few seconds; `/clear` clears it everywhere). `mcorectl --tcp 127.0.0.1:5001` can use the same daemon.
+
+- The daemon switches the radio off 20 seconds after the last window closes. **`/keep on`** keeps it running, so
+  messages keep arriving while no window is open; the next window to connect gets everything that came in.
+- **`/stop`** (or `cardputer-mc stop`) switches the radio off for good; `cardputer-mc status` tells whether it runs.
+  `check` and `uninstall` need the radio to themselves, so stop it first.
+- Not shared between windows: the cursor, the unread counts, the Log and Radio lists, and the UI settings file
+  (the last window to change a setting wins).
+
 ## Staying connected
 
-meshcore-pi drops a client that is silent for 90 seconds (the phone app asks for the battery every minute), which
-used to cut the link after a few idle minutes. cardputer-mc now does the same request every 45 seconds. If the
-link breaks anyway (meshcore-pi dies, the radio hangs), it restarts everything by itself, up to five times with
-growing pauses, and shows `reconnecting ...` in the title bar; F3 or `/connect` tries again by hand.
+meshcore-pi drops a client that is silent for 90 seconds (the phone app asks for the battery every minute). The radio
+daemon does that request every 30 seconds, so the link stays up. If the link breaks anyway (meshcore-pi dies, the
+radio hangs) the daemon stops and every window starts a fresh one by itself, up to five times with growing pauses,
+showing `reconnecting ...` in the title bar; F3 or `/connect` tries again by hand.
 
 ## Radio settings
 

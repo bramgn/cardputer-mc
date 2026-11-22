@@ -413,7 +413,7 @@ def uninstall(argv):
         return 0
     pids = _running_pids()
     if pids:
-        raise SystemExit(f'{APP} or meshcore-pi is still running (pid {", ".join(map(str, pids))}); quit it first')
+        raise SystemExit(f'{APP} or its radio daemon is still running (pid {", ".join(map(str, pids))}); close it, or run: {APP} stop')
 
     remove = [os.path.join(home, n) for n in sorted(os.listdir(home))
               if not (opts.keep_identity and n in IDENTITY_FILES)]
@@ -472,7 +472,7 @@ def check() -> int:
 
     pids = _running_pids()
     if pids:
-        report(False, f'{APP} or meshcore-pi is running (pid {", ".join(map(str, pids))}); quit it first')
+        report(False, f'{APP} or its radio daemon is running (pid {", ".join(map(str, pids))}); close it, or run: {APP} stop')
         return 1
     dev = f'/dev/spidev{spi}.{cs}'
     if not os.path.exists(dev):
@@ -602,7 +602,7 @@ def _bootstrap():
         print(f'{APP} {__version__}')
         sys.exit(0)
     if sys.argv[1:2] in (['-h'], ['--help']):
-        print(f'usage: {APP}\n       {APP} check\n       {APP} install [--name NAME] [--key HEX] [-y]\n       {APP} uninstall [--keep-identity] [--purge] [-y]\n       {APP} --version\n')
+        print(f'usage: {APP}\n       {APP} check | stop | status\n       {APP} install [--name NAME] [--key HEX] [-y]\n       {APP} uninstall [--keep-identity] [--purge] [-y]\n       {APP} --version\n')
         print(__doc__.split('State lives')[0].strip())
         sys.exit(0)
     if sys.argv[1:2] == ['install']:
@@ -697,6 +697,45 @@ class Msg:
 
 def hhmm(ts: int) -> str:
     return datetime.fromtimestamp(ts or datetime.now().timestamp()).strftime('%H:%M')
+
+
+STATUS_RANK = {'': 0, 'failed': 1, 'sent': 2, 'acked': 3}
+
+
+def merge_msgs(mine: list, other: list, since: float = 0) -> list:
+    """Union of two copies of one conversation (this window's and the shared file's). Messages are the same when
+    time, sender and text are. Our own object is kept (acks and retries hold on to it) and takes over the better
+    status and the repeats the other copy has heard. Messages up to `since` were cleared and are dropped."""
+    by_id = {}
+    for m in mine:
+        if (m.recv or m.ts) > since or m.who == '*':
+            by_id[(m.ts, m.who, m.text)] = m
+    for o in other:
+        if (o.recv or o.ts) <= since:
+            continue
+        m = by_id.get((o.ts, o.who, o.text))
+        if m is None:
+            by_id[(o.ts, o.who, o.text)] = o
+            continue
+        if STATUS_RANK.get(o.status, 0) > STATUS_RANK.get(m.status, 0):
+            m.status = o.status
+        heard = list(m.info.get('heard', ()))
+        heard += [h for h in o.info.get('heard', ()) if h not in heard]
+        if heard:
+            m.info['heard'] = heard
+    return sorted(by_id.values(), key=lambda m: (m.recv or m.ts, m.ts))
+
+
+def read_history_file() -> tuple:
+    """(conversations, clear marks) from the history file that every window shares."""
+    try:
+        with open(HISTORY_FILE) as f:
+            raw = json.load(f)
+        cleared = raw.pop('__cleared__', {})
+        return ({(k[0], k[1]): [Msg(**m) for m in ms] for k, ms in
+                 ((json.loads(k), v) for k, v in raw.items())}, cleared if isinstance(cleared, dict) else {})
+    except (OSError, ValueError, TypeError, IndexError, AttributeError):
+        return {}, {}
 
 
 # ======================================================================
@@ -1371,9 +1410,8 @@ class ConnectionMixin:
         try:
             self.status = 'starting local radio...'
             self.dirty = True
-            self.local = LocalRadio()
-            await self.local.start()
-            mc = MeshCore(TCPConnection(HOST, PORT))
+            await ensure_daemon()
+            mc = MeshCore(TCPConnection(HOST, DAEMON_PORT))
             await mc.connect()
             if mc.self_info is None:
                 raise RuntimeError('no response from radio')
@@ -1405,7 +1443,6 @@ class ConnectionMixin:
                     await mc.disconnect()
                 except Exception:
                     pass
-            await self.stop_local()
             if isinstance(e, asyncio.CancelledError):
                 raise
             self.status = f'connect failed: {str(e) or type(e).__name__}'
@@ -1414,8 +1451,7 @@ class ConnectionMixin:
             self.dirty = True
 
     async def keepalive(self):
-        """meshcore-pi drops a client that stays silent for 90 s (the phone app asks for the battery every minute).
-        Doing the same keeps the link up, and the battery in the title bar fresh."""
+        """Ask for the battery now and then: it keeps the title bar's battery fresh (the daemon looks after the radio link)."""
         while self.mc is not None:
             await asyncio.sleep(45)
             if self.mc is not None:
@@ -1427,7 +1463,6 @@ class ConnectionMixin:
             task.cancel()
         mc, self.mc = self.mc, None
         if mc is None:
-            await self.stop_local()
             return
         self.contact_cache = dict(mc.contacts)
         self.pending_acks.clear()
@@ -1438,12 +1473,6 @@ class ConnectionMixin:
             await mc.disconnect()
         except Exception:
             pass
-        await self.stop_local()
-
-    async def stop_local(self):
-        local, self.local = getattr(self, 'local', None), None
-        if local is not None:
-            await local.stop()
 
     async def on_disconnected(self, event):
         # device unplugged / link lost; skip our own manual disconnect
@@ -1454,6 +1483,10 @@ class ConnectionMixin:
         """The link broke without us asking (meshcore-pi died or dropped us): start again, a few times."""
         log.warning('connection lost; reconnecting')
         await self.disconnect('connection lost')
+        if stop_requested():                  # `cardputer-mc stop` was run somewhere: leave the radio off
+            self.status = 'the radio was stopped (cardputer-mc stop); F3 starts it again'
+            self.dirty = True
+            return
         for n, wait in enumerate((2, 5, 15, 30, 60), 1):
             self.status = f'connection lost; reconnecting in {wait}s ({n}/5)'
             self.dirty = True
@@ -2842,9 +2875,9 @@ class CommandsMixin:
     COLON_COMMANDS = frozenset(('contact', 'ct', 'menu', 'ping', 'info', 'reboot', 'theme', 'advert', 'find', 'search',
                                 'trace', 'channel', 'ch', 'quit', 'exit', 'connect', 'disconnect', 'reload', 'options',
                                 'settings', 'clear', 'cls', 'log', 'console', 'radio', 'rx', 'rxlog', 'repeaters',
-                                'help', 'q', 'h', '?'))
+                                'help', 'q', 'h', '?', 'keep', 'stop'))
     COMMAND_NAMES = ('advert', 'channel', 'clear', 'connect', 'contact', 'disconnect', 'help', 'info', 'log', 'menu', 'quit',
-                     'reload', 'repeaters', 'ping', 'radio', 'reboot', 'search', 'options', 'theme', 'trace')
+                     'reload', 'repeaters', 'ping', 'radio', 'reboot', 'search', 'options', 'theme', 'trace', 'keep', 'stop')
 
     def complete(self):
         """Tab completion for /commands in the input line."""
@@ -2914,6 +2947,25 @@ class CommandsMixin:
             self.do_search(arg.strip())
             self.dirty = True
             return
+        if name == 'keep':
+            word = arg.strip().lower()
+            if word not in ('', 'on', 'off'):
+                self.status = 'usage: /keep [on|off]'
+            else:
+                self.keep_daemon = (not self.keep_daemon) if not word else word == 'on'
+                self.save_config()
+                self.status = ('the radio stays on when the last window closes (messages keep coming in; /stop switches it off)'
+                               if self.keep_daemon else 'the radio switches off 20 s after the last window closes')
+            self.dirty = True
+            return
+        if name == 'stop':
+            self.keep_daemon = False
+            self.save_config()
+            rc, message = await asyncio.to_thread(stop_daemon_quietly)
+            self.status = message
+            self.quit = rc == 0
+            self.dirty = True
+            return
         if name in ('t', 'trace'):
             await self.trace_command(arg)
             self.dirty = True
@@ -2949,6 +3001,8 @@ class CommandsMixin:
         if key is None:
             return
         self.history[key] = []
+        if key not in (RX_KEY, LOG_KEY):
+            self.cleared[json.dumps(key)] = time.time()           # other windows drop their copies too
         self.unread.pop(key, None)
         self.msg_sel = self.scroll = 0
         if key != LOG_KEY:
@@ -2973,6 +3027,8 @@ class CommandsMixin:
         ('F8', 'Log: status messages (lights up on problems)'),
         ('F10', 'quit (asks to confirm)'),
         ('^Q', 'quit immediately'),
+        ('/keep [on|off]', 'keep the radio running when the last window closes (messages keep coming in)'),
+        ('/stop', 'switch the radio off for good (all windows) and quit this one'),
         ('^C, Alt-X, Alt-Q', 'ask whether to quit, like F10; the same key again, y or Enter says yes'),
         ('^A ^E', 'start / end of line'),
         ('^B ^F', 'cursor left / right'),
@@ -3515,7 +3571,7 @@ class App(ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMixin, Channel
 
     def save_config(self):
         cfg = {'show_repeaters': self._show_repeaters, 'auto_connect': self.auto_connect,
-               'theme': self.theme, 'favorites': sorted(self.favorites), 'channels': self.chan_prefs, 'retries': self.retries}
+               'keep_daemon': self.keep_daemon, 'theme': self.theme, 'favorites': sorted(self.favorites), 'channels': self.chan_prefs, 'retries': self.retries}
         try:
             os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
             with open(CONFIG_FILE, 'w') as f:
@@ -3523,31 +3579,46 @@ class App(ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMixin, Channel
         except OSError as e:
             log.warning('could not save config: %s', e)
 
-    @staticmethod
-    def load_history() -> dict:
-        try:
-            with open(HISTORY_FILE) as f:
-                raw = json.load(f)
-            return {(k[0], k[1]): [Msg(**m) for m in ms] for k, ms in
-                    ((json.loads(k), v) for k, v in raw.items())}
-        except (OSError, ValueError, TypeError, IndexError):
-            return {}
-
-    def save_history(self):
-        raw = {json.dumps(k): [asdict(m) for m in ms[-self.keep_for(k):] if m.who != '*']
-               for k, ms in self.history.items() if k and k not in (RX_KEY, LOG_KEY)}
-        raw = {k: v for k, v in raw.items() if v}
-        data = json.dumps(raw, default=lambda o: o.hex() if isinstance(o, (bytes, bytearray)) else str(o))
-        if data == self._saved_history:
-            return
+    def sync_history(self):
+        """Write the history, after folding in what other windows have written to the same file meanwhile."""
+        import fcntl
+        shown = None                          # keep the highlighted message highlighted when the list shifts
+        msgs = self.history.get(self.selected) if self.selected else None
+        if self.focus == 'msgs' and msgs and 0 <= self.msg_sel < len(msgs):
+            shown = msgs[self.msg_sel]
         try:
             os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
-            with open(HISTORY_FILE + '.tmp', 'w') as f:
-                f.write(data)
-            os.replace(HISTORY_FILE + '.tmp', HISTORY_FILE)
-            self._saved_history = data
+            with open(HISTORY_FILE + '.lock', 'w') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                disk, disk_cleared = read_history_file()
+                for k, t in disk_cleared.items():
+                    self.cleared[k] = max(self.cleared.get(k, 0), t)
+                own = {k for k in self.history if k and k not in (RX_KEY, LOG_KEY)}
+                for key in own | set(disk):
+                    merged = merge_msgs(self.history.get(key, []), disk.get(key, []), self.cleared.get(json.dumps(key), 0))
+                    if merged or key in self.history:
+                        self.history[key] = merged[-self.keep_for(key):]
+                raw = {json.dumps(k): [asdict(m) for m in ms if m.who != '*']
+                       for k, ms in self.history.items() if k and k not in (RX_KEY, LOG_KEY)}
+                raw = {k: v for k, v in raw.items() if v}
+                if self.cleared:
+                    raw['__cleared__'] = self.cleared
+                data = json.dumps(raw, default=lambda o: o.hex() if isinstance(o, (bytes, bytearray)) else str(o))
+                try:
+                    with open(HISTORY_FILE) as f:
+                        current = f.read()
+                except OSError:
+                    current = None
+                if data != current:           # also rewrites a file that could not be read
+                    with open(HISTORY_FILE + '.tmp', 'w') as f:
+                        f.write(data)
+                    os.replace(HISTORY_FILE + '.tmp', HISTORY_FILE)
         except OSError as e:
             log.warning('could not save history: %s', e)
+        if shown is not None:
+            msgs = self.history.get(self.selected, [])
+            self.msg_sel = next((i for i, m in enumerate(msgs) if m is shown), max(0, min(self.msg_sel, len(msgs) - 1)))
+        self.dirty = True
 
     @status.setter
     def status(self, text: str):
@@ -3560,13 +3631,14 @@ class App(ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMixin, Channel
         self.connecting = False
         self.contact_cache: dict = {}        # last known contacts, kept after disconnect
         self.channels: list[tuple[int, str]] = []
-        self.history: dict[tuple, list[Msg]] = self.load_history()
-        self._saved_history = ''
+        self.history: dict[tuple, list[Msg]]
+        self.history, self.cleared = read_history_file()      # self.cleared: when each conversation was last emptied
         self.unread: dict[tuple, int] = {}
         self.selected: tuple | None = None
         cfg = load_config()
         self._show_repeaters = bool(cfg.get('show_repeaters', False))
         self.auto_connect = bool(cfg.get('auto_connect', True))
+        self.keep_daemon = bool(cfg.get('keep_daemon', False))     # keep the radio on when the last window closes
         self.favorites: set[str] = set(cfg.get('favorites', []))     # contact key prefixes (12 hex)
         self.chan_prefs: dict[str, dict] = cfg.get('channels') if isinstance(cfg.get('channels'), dict) else {}
         self.retries = max(0, min(MAX_RETRIES, int(cfg.get('retries', 1))))
@@ -3760,6 +3832,334 @@ class App(ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMixin, Channel
 
 
 # ======================================================================
+# daemon: owns the radio and shares it between any number of chat windows
+# ======================================================================
+#
+# The daemon starts meshcore-pi (and the 5V supply) and is its one and only client. Every chat window connects to
+# the daemon, which speaks the same companion protocol: requests are passed on one at a time and the answer goes to
+# whoever asked, pushes (adverts, acks, the RX log, ...) go to every window. The radio's message queue is meant for a
+# single reader, so the daemon empties it itself and gives each window its own copy; messages that arrive while no
+# window is open are kept and handed to the next one. The daemon stops when the last window has been gone for a
+# while (or never, with /keep on).
+
+DAEMON_PORT = int(os.environ.get('CARDPUTER_MC_PORT', '5001'))
+DAEMON_PID = os.path.join(HOME_DIR, 'daemon.pid')
+STOP_MARK = os.path.join(HOME_DIR, 'stop-requested')
+INBOX_FILE = os.path.join(HOME_DIR, 'inbox.json')
+DAEMON_LOG = os.path.join(HOME_DIR, 'daemon.log')
+IDLE_FIRST, IDLE_GRACE = 60.0, 20.0         # seconds without a window: before the first one, and after the last
+REQUEST_TIMEOUT = 10.0                      # how long the radio gets to answer one request
+MSG_FRAMES = (7, 8, 16, 17)                 # a message, as an answer to "next message" (old and v3 formats)
+
+
+def _wire(prefix: bytes, payload: bytes) -> bytes:
+    return prefix + len(payload).to_bytes(2, 'little') + payload
+
+
+async def _read_frame(reader, prefix: bytes) -> bytes:
+    """One companion frame: '<' (to the radio) or '>' (from it), a 2-byte length, the payload."""
+    while True:
+        while await reader.readexactly(1) != prefix:
+            pass
+        payload = await reader.readexactly(int.from_bytes(await reader.readexactly(2), 'little'))
+        if payload:
+            return payload
+
+
+def _keep_daemon() -> bool:
+    try:
+        with open(CONFIG_FILE) as f:
+            return bool(json.load(f).get('keep_daemon'))
+    except (OSError, ValueError):
+        return False
+
+
+class _Client:
+    def __init__(self, reader, writer):
+        self.reader, self.writer = reader, writer
+        self.queue: collections.deque = collections.deque()      # messages this window has not fetched yet
+
+    def send(self, payload: bytes):
+        if self.writer.is_closing():
+            return
+        if self.writer.transport.get_write_buffer_size() > 1 << 20:      # a window that stopped reading
+            self.writer.close()
+            return
+        self.writer.write(_wire(b'>', payload))
+
+
+class Daemon:
+    def __init__(self, upstream=None):
+        self.upstream = upstream              # (host, port) of a companion to use as is (tests); else run meshcore-pi
+        self.radio = None if upstream else LocalRadio()
+        self.clients: set = set()
+        self.inbox: collections.deque = collections.deque(self._load_inbox())     # messages nobody has fetched
+        self.lock = asyncio.Lock()            # one request to the radio at a time
+        self.responses: asyncio.Queue = asyncio.Queue()
+        self.wake_drain = asyncio.Event()
+        self.stopping = asyncio.Event()
+        self.up_reader = self.up_writer = None
+        self.had_client = False
+        self.idle_since = time.time()
+        self.sock = None
+
+    # ---- messages nobody has picked up yet, kept across a restart of the daemon
+    @staticmethod
+    def _load_inbox() -> list:
+        try:
+            with open(INBOX_FILE) as f:
+                return [bytes.fromhex(h) for h in json.load(f)]
+        except (OSError, ValueError):
+            return []
+
+    def _save_inbox(self):
+        try:
+            with open(INBOX_FILE + '.tmp', 'w') as f:
+                json.dump([b.hex() for b in self.inbox], f)
+            os.replace(INBOX_FILE + '.tmp', INBOX_FILE)
+        except OSError as e:
+            log.warning('could not save the inbox: %s', e)
+
+    # ---- the radio
+    async def _request(self, payload: bytes) -> list:
+        """Send one request upstream (the lock is held) and return its answer frames (several for the contact list)."""
+        while not self.responses.empty():
+            self.responses.get_nowait()       # a late answer to an earlier request must not be taken for this one
+        self.up_writer.write(_wire(b'<', payload))
+        try:
+            frame = await asyncio.wait_for(self.responses.get(), REQUEST_TIMEOUT)
+            frames = [frame]
+            if frame[0] == 2:                 # start of the contact list: everything up to its end
+                while frame[0] != 4:
+                    frame = await asyncio.wait_for(self.responses.get(), REQUEST_TIMEOUT)
+                    frames.append(frame)
+            return frames
+        except asyncio.TimeoutError:
+            return []
+
+    async def _read_upstream(self):
+        try:
+            while True:
+                frame = await _read_frame(self.up_reader, b'>')
+                if frame[0] < 0x80:
+                    self.responses.put_nowait(frame)
+                elif frame[0] == 0x83:        # messages waiting: we collect them ourselves
+                    self.wake_drain.set()
+                else:                         # any other push goes to every window
+                    for c in list(self.clients):
+                        c.send(frame)
+        except (asyncio.IncompleteReadError, ConnectionError, OSError) as e:
+            log.error('lost the connection to meshcore-pi (%s)', e or 'closed')
+        self.stopping.set()
+
+    async def _drain_loop(self):
+        while True:
+            await self.wake_drain.wait()
+            self.wake_drain.clear()
+            async with self.lock:
+                while True:
+                    frames = await self._request(b'\x0a')                 # next message
+                    if frames and frames[0][0] in MSG_FRAMES:
+                        self._deliver(frames[0])
+                    else:
+                        break
+
+    def _deliver(self, frame: bytes):
+        if self.clients:
+            for c in list(self.clients):
+                c.queue.append(frame)
+                c.send(b'\x83')               # messages waiting
+        else:
+            self.inbox.append(frame)
+            self._save_inbox()
+
+    # ---- the windows
+    async def _on_client(self, reader, writer):
+        client = _Client(reader, writer)
+        self.clients.add(client)
+        self.had_client = True
+        log.info('window connected (%d now)', len(self.clients))
+        if self.inbox:                        # what came in while nobody was there
+            client.queue.extend(self.inbox)
+            self.inbox.clear()
+            self._save_inbox()
+            client.send(b'\x83')
+        try:
+            while True:
+                payload = await _read_frame(reader, b'<')
+                if payload[0] == 10:          # next message: from this window's own copy
+                    client.send(client.queue.popleft() if client.queue else b'\x0a')
+                    continue
+                async with self.lock:
+                    for frame in await self._request(payload):
+                        client.send(frame)
+        except (asyncio.IncompleteReadError, ConnectionError, OSError):
+            pass
+        finally:
+            self.clients.discard(client)
+            writer.close()
+            if not self.clients:
+                if client.queue:              # the last window left with unread messages: keep them for the next one
+                    self.inbox.extendleft(reversed(client.queue))
+                    self._save_inbox()
+                self.idle_since = time.time()
+            log.info('window gone (%d left)', len(self.clients))
+
+    async def _housekeeping(self):
+        ticks = 0
+        while True:
+            await asyncio.sleep(2)
+            ticks += 1
+            if ticks % 15 == 0:               # meshcore-pi drops a client that stays silent for 90 s
+                async with self.lock:
+                    await self._request(b'\x14')                          # battery
+            if ticks % 15 == 7:
+                self.wake_drain.set()         # in case a "messages waiting" push got lost
+            if not self.clients and not _keep_daemon():
+                grace = IDLE_GRACE if self.had_client else IDLE_FIRST
+                if time.time() - self.idle_since > grace:
+                    log.info('no window for %.0f s: stopping', grace)
+                    self.stopping.set()
+
+    async def run(self) -> int:
+        self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.sock.bind((HOST, DAEMON_PORT))
+        except OSError:
+            log.error('port %d is in use: another daemon is running', DAEMON_PORT)
+            return 1
+        os.makedirs(HOME_DIR, exist_ok=True)
+        with open(DAEMON_PID, 'w') as f:
+            f.write(str(os.getpid()))
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, self.stopping.set)
+        tasks, server, rc = [], None, 0
+        try:
+            if self.radio:
+                await self.radio.start()
+            host, port = self.upstream or (HOST, PORT)
+            self.up_reader, self.up_writer = await asyncio.open_connection(host, port)
+            tasks.append(asyncio.create_task(self._read_upstream()))
+            async with self.lock:
+                hello = await self._request(b'\x01\x03      cmcd')        # app start
+                if not hello or hello[0][0] != 5:
+                    raise RuntimeError('the radio did not answer')
+                await self._request(b'\x16\x03')                           # device query: protocol 3 (SNR with messages)
+            tasks += [asyncio.create_task(self._drain_loop()), asyncio.create_task(self._housekeeping())]
+            self.wake_drain.set()
+            self.sock.listen(8)               # until now the windows were refused
+            server = await asyncio.start_server(self._on_client, sock=self.sock)
+            log.info('radio daemon ready on %s:%d', HOST, DAEMON_PORT)
+            await self.stopping.wait()
+        except Exception:
+            log.exception('radio daemon failed')
+            rc = 1
+        finally:
+            for t in tasks:
+                t.cancel()
+            if server is not None:
+                server.close()
+            for c in list(self.clients):
+                c.writer.close()
+            if self.up_writer is not None:
+                self.up_writer.close()
+            if self.radio:
+                await self.radio.stop()
+            self.sock.close()
+            try:
+                os.remove(DAEMON_PID)
+            except OSError:
+                pass
+            log.info('radio daemon stopped')
+        return rc
+
+
+def daemon_pid():
+    """pid of the running daemon, or None."""
+    try:
+        with open(DAEMON_PID) as f:
+            pid = int(f.read())
+        with open(f'/proc/{pid}/cmdline', 'rb') as f:
+            args = f.read().decode(errors='replace').split('\0')
+        return pid if 'daemon' in args else None
+    except (OSError, ValueError):
+        return None
+
+
+async def daemon_reachable() -> bool:
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(HOST, DAEMON_PORT), 2)
+    except (OSError, asyncio.TimeoutError):
+        return False
+    writer.close()
+    return True
+
+
+async def ensure_daemon():
+    """Make sure the radio daemon is up, starting it (detached, so it outlives this window) when it is not."""
+    if await daemon_reachable():
+        return
+    if not available():
+        raise RuntimeError(f'local radio not available (need {SPIDEV}); run: {APP} install')
+    try:
+        os.remove(STOP_MARK)
+    except OSError:
+        pass
+    os.makedirs(HOME_DIR, exist_ok=True)
+    start_at = os.path.getsize(DAEMON_LOG) if os.path.exists(DAEMON_LOG) else 0
+    with open(DAEMON_LOG, 'ab') as out:
+        proc = subprocess.Popen([PI_PYTHON, os.path.realpath(__file__), 'daemon'], cwd=HOME_DIR, stdin=subprocess.DEVNULL,
+                                stdout=out, stderr=out, start_new_session=True)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + START_TIMEOUT + 15
+    while loop.time() < deadline:
+        await asyncio.sleep(0.4)
+        if await daemon_reachable():
+            return
+        if proc.poll() is not None:
+            raise RuntimeError(f'radio daemon exited ({proc.returncode}): {_tail(DAEMON_LOG, start_at)}')
+    raise RuntimeError('radio daemon did not start in time')
+
+
+def stop_requested() -> bool:
+    """True just after `cardputer-mc stop`: the windows must not start the radio again."""
+    try:
+        return time.time() - os.path.getmtime(STOP_MARK) < 30
+    except OSError:
+        return False
+
+
+def stop_daemon_quietly() -> tuple:
+    """Stop the radio daemon; (exit code, message)."""
+    pid = daemon_pid()
+    if pid is None:
+        return 0, 'the radio daemon is not running'
+    with open(STOP_MARK, 'w'):
+        pass
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(100):
+        time.sleep(0.1)
+        if daemon_pid() is None:
+            return 0, 'radio daemon stopped; the radio is off'
+    return 1, f'the radio daemon (pid {pid}) did not stop within 10 s'
+
+
+def stop_daemon() -> int:
+    rc, message = stop_daemon_quietly()
+    print(message)
+    return rc
+
+
+def daemon_status() -> int:
+    pid = daemon_pid()
+    print(f'radio daemon: running (pid {pid}), keep running when closed: {"on" if _keep_daemon() else "off"}'
+          if pid else 'radio daemon: not running')
+    return 0
+
+
+# ======================================================================
 # cli
 # ======================================================================
 
@@ -3804,14 +4204,14 @@ async def run(scr, args):
         app.start_auto_connect()
     async def autosave():
         while True:
-            await asyncio.sleep(10)
-            app.save_history()
+            await asyncio.sleep(5)
+            app.sync_history()
     saver = asyncio.create_task(autosave())
     try:
         await ui(scr, app)
     finally:
         saver.cancel()
-        app.save_history()
+        app.sync_history()
         await app.disconnect()
 
 def main():
@@ -3819,10 +4219,21 @@ def main():
         prog=APP, description='ncurses MeshCore chat for the M5 CardputerZero with the Cap-LoRa-1262',
         epilog=f'First run: {APP} install   (sets up meshcore-pi, a venv and {PI_CONFIG})')
     ap.add_argument('--version', action='version', version=f'{APP} {__version__}')
-    ap.add_argument('command', nargs='?', choices=['check'],
-                    help='check: test the SX1262 wiring (no airtime) and exit; without it the chat starts')
-    if ap.parse_args().command == 'check':
+    ap.add_argument('command', nargs='?', choices=['check', 'daemon', 'stop', 'status'],
+                    help='check: test the SX1262 wiring (no airtime); daemon: run the radio daemon in the foreground '
+                         '(chat windows start it by themselves); stop: stop it and switch the radio off; '
+                         'status: is it running; without a command the chat starts')
+    command = ap.parse_args().command
+    if command == 'check':
         sys.exit(check())
+    if command == 'stop':
+        sys.exit(stop_daemon())
+    if command == 'status':
+        sys.exit(daemon_status())
+    if command == 'daemon':
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s', datefmt='%H:%M:%S')
+        up = os.environ.get('CARDPUTER_MC_UPSTREAM')      # host:port of a companion to use instead of meshcore-pi (tests)
+        sys.exit(asyncio.run(Daemon((up.split(':')[0], int(up.split(':')[1])) if up else None).run()))
     args = argparse.Namespace()
     locale.setlocale(locale.LC_ALL, '')
     os.environ.setdefault('ESCDELAY', '25')   # ncurses waits 1000ms after Esc by default
