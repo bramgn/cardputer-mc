@@ -72,6 +72,9 @@ are usable without reaching for the tiny Fn row. Typing in the list, the message
 The arrow keys sit on the CardputerZero's Fn layer, so whenever you are not typing (not in the prompt, a question
 or a setting being edited) `z` `c` `f` `x` act as left, right, up and down, in the lists, menus and windows.
 
+Space or `/` start typing from anywhere: Space continues what you were writing, `/` starts a new command (a draft
+is parked on Ctrl-Y), so `/q` always quits.
+
 Going from the list to the messages (Right, `c` or Tab) puts the cursor on the message that is on the same
 screen row as the list's cursor, or on the last message when that row is empty.
 

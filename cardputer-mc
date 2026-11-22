@@ -1645,8 +1645,10 @@ class MessagingMixin:
                           (textwrap.wrap(m.text, 64) or ['']))
             else:
                 self.show('Message details', self.message_details(msgs[self.msg_sel]))
+        elif k in ('/', ' '):
+            self.start_typing(k)
         elif isinstance(k, str) and (k.isprintable() or k == '\x7f'):
-            pass                          # typing does not start a message; Left, then Enter on the item does
+            pass                          # other letters do not start a message; Enter, Space or / do
         else:
             return False
         self.dirty = True
@@ -2720,6 +2722,7 @@ class CommandsMixin:
         ('Tab', 'list > messages > function keys > list (messages: Up/Down, Enter = details, r = resend)'),
         ('Left / Right', 'list <-> messages; on the function keys: pick one, Enter presses it'),
         ('Esc', 'back to the list (from the input, the messages and the function keys)'),
+        ('Space, /', 'start typing from anywhere; / starts a command, so /q always quits'),
         ('F1', 'this help'),
         ('F2', 'options (name, TX power, advert, theme, ...)'),
         ('F3', 'choose device and connect / disconnect'),
@@ -2980,6 +2983,8 @@ class UiMixin:
             self.focus = 'side'
         elif k == '\n':
             await self.handle_key(getattr(curses, 'KEY_' + self.FKEYS[self.fsel]))
+        elif k in ('/', ' '):
+            self.start_typing(k)
         elif isinstance(k, str) and k.isprintable():
             pass
         elif isinstance(k, str) and not (len(k) == 1 and ord(k) in (CTRL_Q, CTRL_C)):
@@ -2997,6 +3002,14 @@ class UiMixin:
         if item != self.selected or shown_item != self.selected:     # not drawn yet since the selection changed
             return last
         return min(rows.get(row, last), last)
+
+    def start_typing(self, k: str):
+        """Space activates the prompt; / activates it with a new command, so /q always quits."""
+        self.focus = 'input'
+        if k == '/':                          # always a fresh command; a half-written draft is parked on Ctrl-Y
+            if self.buf:
+                self.kill = self.buf
+            self.buf, self.pos = '/', 1
 
     def can_chat(self) -> bool:
         """True when the selected item takes typed messages: a channel or a chat contact."""
@@ -3031,8 +3044,10 @@ class UiMixin:
                 self.focus = 'fkeys'
         elif k in (curses.KEY_LEFT, '\x1b'):
             pass
+        elif k in ('/', ' '):
+            self.start_typing(k)
         elif isinstance(k, str) and k.isprintable():
-            pass                              # typing does not start a message; press Enter for that
+            pass                              # other letters do not start a message; Enter, Space or / do
         elif isinstance(k, str) and not (len(k) == 1 and ord(k) in (CTRL_Q, CTRL_C)):
             return False
         else:
@@ -3142,10 +3157,7 @@ class UiMixin:
         vis = w - len(prompt) - 1
         start = max(0, self.pos - vis + 1)
         if self.focus != 'input' and not self.buf:
-            hint = {'msgs': 'Enter: details · Left: list · Tab: function keys',
-                    'fkeys': 'Enter: press the highlighted key · Esc: back'}.get(
-                self.focus, 'Enter: write a message · F7: menu' if self.can_chat() else 'Enter: menu')
-            scr.addnstr(h - 2, 0, hint, w - 1, curses.A_DIM)
+            pass                              # no prompt until Enter, Space or / makes it active
         else:
             scr.addnstr(h - 2, 0, prompt + self.buf[start:start + vis], w - 1)
             if not self.buf and cli:
