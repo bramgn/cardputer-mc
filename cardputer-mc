@@ -2339,7 +2339,7 @@ class MessagingMixin:
 # ======================================================================
 
 class SettingsMixin:
-    SETTINGS = ('info', 'autoconnect', 'name', 'tx_power', 'location', 'clock', 'advert', 'reboot', 'auto_add', 'repeaters', 'retries', 'theme')
+    SETTINGS = ('info', 'autoconnect', 'detach', 'name', 'tx_power', 'location', 'clock', 'advert', 'reboot', 'auto_add', 'repeaters', 'retries', 'theme')
 
     def setting_rows(self) -> list[tuple[str, str]]:
         si = (self.mc.self_info if self.mc else None) or {}
@@ -2348,6 +2348,7 @@ class SettingsMixin:
         return [
             ('This radio', 'public key, firmware, battery...'),
             ('Connect on startup', onoff(self.auto_connect)),
+            ('Detach (radio stays on)', onoff(self.keep_daemon)),
             ('Device name', dash('name')),
             ('TX power (dBm)', dash('tx_power')),
             ('Location (lat, lon)', self.my_position_text()),
@@ -2556,6 +2557,12 @@ class SettingsMixin:
             self.settings_open = False
             self.advert_back = 'options' if self.mc else None
             await self.advert()
+            return
+        if which == 'detach':
+            self.keep_daemon = not self.keep_daemon
+            self.save_config()
+            self.status = ('detached: the radio stays on when the last window closes (messages keep coming in)'
+                           if self.keep_daemon else 'attached: the radio switches off 20 s after the last window closes')
             return
         if which == 'repeaters':
             self.show_repeaters = not self.show_repeaters
@@ -3353,9 +3360,9 @@ class CommandsMixin:
     COLON_COMMANDS = frozenset(('contact', 'ct', 'menu', 'actions', 'act', 'ping', 'info', 'reboot', 'theme', 'advert', 'find', 'search',
                                 'trace', 'channel', 'ch', 'quit', 'exit', 'connect', 'disconnect', 'reload', 'options',
                                 'settings', 'clear', 'cls', 'log', 'console', 'radio', 'rx', 'rxlog', 'repeaters',
-                                'help', 'q', 'h', '?', 'keep', 'stop', 'sound'))
+                                'help', 'q', 'h', '?', 'keep', 'detach', 'stop', 'sound'))
     COMMAND_NAMES = ('act', 'actions', 'advert', 'channel', 'clear', 'connect', 'contact', 'disconnect', 'help', 'info', 'log', 'menu', 'quit',
-                     'reload', 'repeaters', 'ping', 'radio', 'reboot', 'search', 'options', 'theme', 'trace', 'keep', 'stop', 'sound')
+                     'reload', 'repeaters', 'ping', 'radio', 'reboot', 'search', 'options', 'theme', 'trace', 'keep', 'detach', 'stop', 'sound')
 
     def complete(self):
         """Tab completion for /commands in the input line."""
@@ -3425,10 +3432,10 @@ class CommandsMixin:
             self.do_search(arg.strip())
             self.dirty = True
             return
-        if name == 'keep':
+        if name in ('keep', 'detach'):
             word = arg.strip().lower()
             if word not in ('', 'on', 'off'):
-                self.status = 'usage: /keep [on|off]'
+                self.status = 'usage: /detach [on|off]'
             else:
                 self.keep_daemon = (not self.keep_daemon) if not word else word == 'on'
                 self.save_config()
@@ -3520,7 +3527,7 @@ class CommandsMixin:
         ('F3', 'choose device and connect / disconnect'),
         ('F9', 'Radio: every packet heard (Tab: select, Enter = details)'),
         ('^Q', 'quit immediately'),
-        ('/keep [on|off]', 'keep the radio running when the last window closes (messages keep coming in)'),
+        ('/detach [on|off]', 'Detach: keep the radio running when the last window closes (also /keep; Options has it too)'),
         ('/stop', 'switch the radio off for good (all windows) and quit this one'),
         ('/sound [off|private|all|test]', 'chime on a new message, played by the radio daemon (default: private messages only)'),
         ('^C, Alt-X, Alt-Q', 'ask whether to quit, like F8; the same key again, y or Enter says yes'),

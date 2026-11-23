@@ -114,7 +114,7 @@ SSH session at the same time: each window has its own cursor and input line, the
 the message history (merged through `history.json`, so a message sent in one window shows up in the other within
 a few seconds; `/clear` clears it everywhere). `mcorectl --tcp 127.0.0.1:5001` can use the same daemon.
 
-- The daemon switches the radio off 20 seconds after the last window closes. **`/keep on`** keeps it running, so
+- The daemon switches the radio off 20 seconds after the last window closes. **Detach** (Options, or `/detach on`; `/keep` is the same) keeps it running, so
   messages keep arriving while no window is open; the next window to connect gets everything that came in.
 - **`/stop`** (or `cardputer-mc stop`) switches the radio off for good; `cardputer-mc status` tells whether it runs.
   `check` and `uninstall` need the radio to themselves, so stop it first.
@@ -170,9 +170,9 @@ cardputer-mc keep off       # back to: the daemon stops a minute after the last 
 cardputer-mc stop           # switch the radio off for good
 ```
 
-With `keep on` the Cardputer terminal is free for other things while the radio keeps listening; messages that arrive
+With detach on (`keep on`) the Cardputer terminal is free for other things while the radio keeps listening; messages that arrive
 meanwhile wait in the daemon's inbox and show up in the next window, in `cardputer-mc read` or `cardputer-mc listen`.
-The price is power: the radio's 5V rail and one CPU core stay on. `/keep on|off` and `/stop` do the same inside the chat.
+The price is some power: the radio's 5V rail stays on and the radio keeps listening. `/detach on|off` and `/stop` do the same inside the chat.
 
 **Sound.** The daemon plays a chime on the Cardputer's speaker when a message arrives, also with no window open:
 two rising tones for a private message, one lower tone for a channel message. `cardputer-mc sound off|private|all|test`
