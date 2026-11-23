@@ -420,6 +420,33 @@ index cc79a37..b27169f 100644
                  logger.debug(f"CMD_SET_RADIO_PARAMS, {hexlify(frame[1:]).decode()}")
  
 '''
+
+PI_PATCH_RX = r'''diff --git a/interfaces/lorainterface.py b/interfaces/lorainterface.py
+--- a/interfaces/lorainterface.py
++++ b/interfaces/lorainterface.py
+@@ -137,9 +137,9 @@
+ 
+     # Receive thread
+     #
+-    # FIXME: This thread busywaits on data from the LoRa chip. This could be a setting I've missed,
+-    # or it might just be how the library works. Either way, it sits there using up an entire core.
+-    # Need either better config, a better library, or to rewrite the current one so it behaves nicely.
++    # LoRaRF's wait() spins in a Python loop until the interrupt handler stores the IRQ status, which
++    # used up an entire core. The interrupt arrives on its own, so sleep until it has, then let wait()
++    # (which returns at once) do the rest.
+     def rx_thread(self):
+         logger.debug("LoRa rx thread listening")
+ 
+@@ -147,6 +147,8 @@
+     
+         s = ["STATUS_DEFAULT", "STATUS_TX_WAIT", "STATUS_TX_TIMEOUT", "STATUS_TX_DONE", "STATUS_RX_WAIT", "STATUS_RX_CONTINUOUS", "STATUS_RX_TIMEOUT", "STATUS_RX_DONE", "STATUS_HEADER_ERR", "STATUS_CRC_ERR", "STATUS_CAD_WAIT", "STATUS_CAD_DETECTED", "STATUS_CAD_DONE"]
+         while True:
++            while not self.LoRa._statusIrq:
++                time.sleep(0.002)
+             self.LoRa.wait()
+ 
+             # Let the interrupt handler finish (not set after a transmit, hence the timeout)
+'''
 APT_PACKAGES = ['git', 'python3-venv', 'python3-rpi-lgpio', 'python3-lgpio']
 PIP_PACKAGES = ['meshcore', 'pycryptodome', 'aiotools', 'pyserial_asyncio', 'typing-extensions', 'LoRaRF']
 
@@ -555,7 +582,8 @@ def install(argv):
     for name, patch in (('multi-byte path hashes, RX race', PI_PATCH), ('ACKs with extra bytes', PI_PATCH_ACK),
                         ('TX power command (applied between packets, max 22)', PI_PATCH_TX),
                         ('binary requests: status, telemetry, neighbours of repeaters', PI_PATCH_BIN),
-                        ('import contact (meshcore:// links)', PI_PATCH_IMPORT)):
+                        ('import contact (meshcore:// links)', PI_PATCH_IMPORT),
+                        ('radio receive thread sleeps instead of using a whole core', PI_PATCH_RX)):
         if subprocess.run(['git', '-C', PI_DIR, 'apply', '--check', '-R', '-'], input=patch, text=True,
                           capture_output=True).returncode == 0:
             print(f'  fix already applied: {name}')
