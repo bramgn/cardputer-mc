@@ -815,7 +815,7 @@ def _bootstrap():
         print(f'{APP} {__version__}')
         sys.exit(0)
     if sys.argv[1:2] in (['-h'], ['--help']):
-        print(f'usage: {APP} [--remote [USER@]HOST]\n       {APP} [--remote HOST] send TARGET TEXT... | read [TARGET] | contacts | addcontact LINK | channels | info | advert | listen\n'
+        print(f'usage: {APP} [--remote [USER@]HOST]\n       {APP} [--remote HOST] send TARGET TEXT... | read [TARGET] | contacts | addcontact LINK | channels | info | advert | ping TARGET | listen\n'
               f'       {APP} check | up [--keep] | keep [on|off] | sound [off|private|all|test] | stop | status\n       {APP} install [--client] [--name NAME] [--key HEX] [-y]\n'
               f'       {APP} uninstall [--keep-identity] [--purge] [-y]\n       {APP} --version   ({APP} COMMAND --help for details)\n')
         print(__doc__.split('State lives')[0].strip())
@@ -2994,6 +2994,24 @@ class ContactsMixin:
         if complete:
             out.append(f'round trip {rtt * 1000:.0f} ms (including the time to talk to the radio)')
         return out
+
+    async def ping_once(self, c: dict) -> tuple[float | None, list[float], str]:
+        """One zero-hop trace to a repeater/room server: (round trip in ms or None, SNR per hop, why it failed)."""
+        t0 = time.monotonic()
+        async with self.radio_lock:
+            r = await self.mc.commands.send_trace(path=c['public_key'][:2])
+        if r.type == EventType.ERROR:
+            return None, [], f'not sent: {describe_error(r.payload)}'
+        tag = int.from_bytes(r.payload['expected_ack'], 'little')
+        timeout = r.payload.get('suggested_timeout', 10000) / 1000 + 5
+        ev = await self.mc.wait_for_event(EventType.TRACE_DATA, attribute_filters={'tag': tag}, timeout=timeout)
+        if ev is None:
+            return None, [], 'no reply'
+        nodes = ev.payload.get('path', [])
+        snrs = [nd['snr'] for nd in nodes if 'snr' in nd]
+        if len(snrs) < 1:
+            return None, [], 'incomplete reply'
+        return (time.monotonic() - t0) * 1000, snrs, ''
 
     def ping_command(self, arg: str):
         """/ping [name]: zero-hop trace to the selected (or named) repeater or room server."""
@@ -5255,6 +5273,47 @@ async def cmd_info(a) -> int:
         await cli_finish(app)
 
 
+async def cmd_ping(a) -> int:
+    """Zero-hop traces to a repeater or room server, like ping(8): one line per try, then a summary."""
+    app = await cli_app()
+    try:
+        key, name = resolve_target(app, a.target)
+        c = next((c for k, _, c in cli_contacts(app) if k == key), None) if key[0] == 'd' else None
+        if c is None:
+            raise CliError(f'{name} is a channel: only repeaters and room servers can be pinged', 2)
+        if c.get('type') not in (2, 3):
+            raise CliError(f'{name} is a normal client: only repeaters and room servers answer a ping '
+                           f'(use `{APP} send` to test a client: the acknowledgement is the proof)', 2)
+        print(f'PING {name} ({c["public_key"][:8]}), zero hop')
+        times, sent = [], 0
+        stop = asyncio.Event()
+        asyncio.get_running_loop().add_signal_handler(signal.SIGINT, stop.set)      # Ctrl-C: stop, then print the summary
+        while not stop.is_set() and (a.count == 0 or sent < a.count):
+            if sent:
+                try:
+                    await asyncio.wait_for(stop.wait(), a.interval)
+                except asyncio.TimeoutError:
+                    pass
+                if stop.is_set():
+                    break
+            sent += 1
+            ms, snrs, why = await app.ping_once(c)
+            now = datetime.now().strftime('%H:%M:%S')
+            if ms is None:
+                print(f'{now} seq={sent} {why}', flush=True)
+            else:
+                times.append(ms)
+                print(f'{now} seq={sent} time={ms:.0f} ms snr={" ".join(f"{x:.2f}" for x in snrs)} dB', flush=True)
+        lost = sent - len(times)
+        print(f'--- {name} ping statistics ---')
+        print(f'{sent} sent, {len(times)} received, {100 * lost // max(sent, 1)}% lost')
+        if times:
+            print(f'round trip min/avg/max = {min(times):.0f}/{sum(times) / len(times):.0f}/{max(times):.0f} ms')
+        return 0 if times else 1
+    finally:
+        await cli_finish(app)
+
+
 async def cmd_advert(a) -> int:
     app = await cli_app()
     try:
@@ -5372,6 +5431,10 @@ def main():
     sp.add_argument('link')
     sp = sub.add_parser('info', help='what the radio says about itself (name, key, frequency, battery)')
     sp.add_argument('--json', action='store_true')
+    sp = sub.add_parser('ping', help='zero-hop trace to a repeater or room server: ping NAME [-c N] [-i SEC] (SNR and round trip; -c 0 = until Ctrl-C)')
+    sp.add_argument('target')
+    sp.add_argument('-c', '--count', type=int, default=4, metavar='N', help='number of pings (0 = until Ctrl-C)')
+    sp.add_argument('-i', '--interval', type=float, default=2.0, metavar='SEC')
     sp = sub.add_parser('advert', help='announce this node (zero hop; --flood for everyone)')
     sp.add_argument('--flood', action='store_true')
     sp = sub.add_parser('listen', help='print incoming messages as they arrive (Ctrl-C ends)')
@@ -5413,7 +5476,7 @@ def main():
             sys.exit(f'{APP}: {e}')
         print('radio daemon: running' + (', and it stays running when no window is open' if _keep_daemon() else ''))
         sys.exit(0)
-    if command in ('send', 'read', 'contacts', 'channels', 'info', 'advert', 'listen', 'addcontact'):
+    if command in ('send', 'read', 'contacts', 'channels', 'info', 'advert', 'listen', 'addcontact', 'ping'):
         sys.exit(run_cli(globals()['cmd_' + command], opts))
     if command == 'check':
         sys.exit(check())

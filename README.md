@@ -135,6 +135,7 @@ cardputer-mc contacts [part-of-name]    # --json
 cardputer-mc channels
 cardputer-mc info                       # name, key, frequency, battery (--json)
 cardputer-mc advert [--flood]
+cardputer-mc ping Repeater78 [-c 4] [-i 2]  # (-c 0: until Ctrl-C) zero-hop trace to a repeater or room server: SNR + round trip; exit 0 if any answered
 cardputer-mc up                         # start the daemon and exit
 ```
 
