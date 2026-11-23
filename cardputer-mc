@@ -1127,6 +1127,18 @@ HOST, PORT = '127.0.0.1', 5000          # meshcore-pi's companion wifi.listen / 
 PI_PYTHON = VENV_PY
 SPIDEV = '/dev/spidev0.1'                # Cap-LoRa-1262 sits on SPI0 CS1
 LED_5V = '/sys/class/leds/ext_5v_out/brightness'
+
+
+def cardputer_keyboard() -> bool:
+    """True when we run in the CardputerZero's own terminal (its small screen and five keys under it), False in an ssh
+    session, on a PC, or anywhere else. CARDPUTER_MC_KEYBOARD=1 or 0 overrides the guess."""
+    forced = os.environ.get('CARDPUTER_MC_KEYBOARD', '').strip().lower()
+    if forced in ('1', 'yes', 'on', 'true'):
+        return True
+    if forced in ('0', 'no', 'off', 'false'):
+        return False
+    return os.path.exists(LED_5V) and not (os.environ.get('SSH_CONNECTION') or os.environ.get('SSH_TTY'))
+
 LOG_FILE = os.path.join(HOME_DIR, 'local-radio.log')
 READY = b'Server listening on'
 START_TIMEOUT = 25.0
@@ -2339,7 +2351,7 @@ class MessagingMixin:
 # ======================================================================
 
 class SettingsMixin:
-    SETTINGS = ('info', 'autoconnect', 'detach', 'name', 'tx_power', 'location', 'clock', 'advert', 'reboot', 'auto_add', 'repeaters', 'retries', 'theme')
+    SETTINGS = ('info', 'autoconnect', 'name', 'tx_power', 'location', 'clock', 'advert', 'reboot', 'auto_add', 'repeaters', 'retries', 'theme')
 
     def setting_rows(self) -> list[tuple[str, str]]:
         si = (self.mc.self_info if self.mc else None) or {}
@@ -2348,7 +2360,6 @@ class SettingsMixin:
         return [
             ('This radio', 'public key, firmware, battery...'),
             ('Connect on startup', onoff(self.auto_connect)),
-            ('Detach (radio stays on)', onoff(self.keep_daemon)),
             ('Device name', dash('name')),
             ('TX power (dBm)', dash('tx_power')),
             ('Location (lat, lon)', self.my_position_text()),
@@ -2557,12 +2568,6 @@ class SettingsMixin:
             self.settings_open = False
             self.advert_back = 'options' if self.mc else None
             await self.advert()
-            return
-        if which == 'detach':
-            self.keep_daemon = not self.keep_daemon
-            self.save_config()
-            self.status = ('detached: the radio stays on when the last window closes (messages keep coming in)'
-                           if self.keep_daemon else 'attached: the radio switches off 20 s after the last window closes')
             return
         if which == 'repeaters':
             self.show_repeaters = not self.show_repeaters
@@ -3360,9 +3365,9 @@ class CommandsMixin:
     COLON_COMMANDS = frozenset(('contact', 'ct', 'menu', 'actions', 'act', 'ping', 'info', 'reboot', 'theme', 'advert', 'find', 'search',
                                 'trace', 'channel', 'ch', 'quit', 'exit', 'connect', 'disconnect', 'reload', 'options',
                                 'settings', 'clear', 'cls', 'log', 'console', 'radio', 'rx', 'rxlog', 'repeaters',
-                                'help', 'q', 'h', '?', 'keep', 'detach', 'stop', 'sound'))
+                                'help', 'q', 'h', '?', 'keep', 'stop', 'sound'))
     COMMAND_NAMES = ('act', 'actions', 'advert', 'channel', 'clear', 'connect', 'contact', 'disconnect', 'help', 'info', 'log', 'menu', 'quit',
-                     'reload', 'repeaters', 'ping', 'radio', 'reboot', 'search', 'options', 'theme', 'trace', 'keep', 'detach', 'stop', 'sound')
+                     'reload', 'repeaters', 'ping', 'radio', 'reboot', 'search', 'options', 'theme', 'trace', 'keep', 'stop', 'sound')
 
     def complete(self):
         """Tab completion for /commands in the input line."""
@@ -3432,10 +3437,10 @@ class CommandsMixin:
             self.do_search(arg.strip())
             self.dirty = True
             return
-        if name in ('keep', 'detach'):
+        if name == 'keep':
             word = arg.strip().lower()
             if word not in ('', 'on', 'off'):
-                self.status = 'usage: /detach [on|off]'
+                self.status = 'usage: /keep [on|off]'
             else:
                 self.keep_daemon = (not self.keep_daemon) if not word else word == 'on'
                 self.save_config()
@@ -3527,7 +3532,7 @@ class CommandsMixin:
         ('F3', 'choose device and connect / disconnect'),
         ('F9', 'Radio: every packet heard (Tab: select, Enter = details)'),
         ('^Q', 'quit immediately'),
-        ('/detach [on|off]', 'Detach: keep the radio running when the last window closes (also /keep; Options has it too)'),
+        ('/keep [on|off]', 'keep the radio running when the last window closes (messages keep coming in)'),
         ('/stop', 'switch the radio off for good (all windows) and quit this one'),
         ('/sound [off|private|all|test]', 'chime on a new message, played by the radio daemon (default: private messages only)'),
         ('^C, Alt-X, Alt-Q', 'ask whether to quit, like F8; the same key again, y or Enter says yes'),
@@ -3601,11 +3606,23 @@ class UiMixin:
                    'h': curses.KEY_LEFT, 'l': curses.KEY_RIGHT, 'k': curses.KEY_UP, 'j': curses.KEY_DOWN,
                    'G': curses.KEY_END, '\x04': curses.KEY_NPAGE, '\x15': curses.KEY_PPAGE}
 
+    @staticmethod
+    def is_last_window() -> bool:
+        """True when this window is the only one on the local radio daemon (then quitting can switch the radio off)."""
+        if REMOTE or daemon_pid() is None:
+            return False
+        try:
+            with open(STATUS_FILE) as f:
+                st = json.load(f)
+            return st.get('windows', 1) <= 1 or time.time() - st.get('written', 0) > 30
+        except (OSError, ValueError):
+            return True
+
     def letters_are_text(self) -> bool:
         """True while typed letters are text: a question being answered, a setting being edited, the prompt."""
         if self.ask or (self.settings_open and self.set_edit is not None):
             return True
-        modal = (self.details is not None or self.help_open or self.confirm_quit or self.confirm_remove
+        modal = (self.details is not None or self.help_open or self.confirm_quit or self.confirm_stop or self.confirm_remove
                  or self.settings_open or self.cmenu_open or self.advert_menu_open or self.search)
         return self.focus == 'input' and not modal
 
@@ -3619,9 +3636,24 @@ class UiMixin:
             return
         if self.confirm_quit:                 # the quit question beats everything else, windows included
             if k in ('y', 'Y', '\n') or k in self.QUIT_KEYS:      # the shortcut again counts as yes
-                self.quit = True
+                if self.is_last_window():
+                    self.confirm_quit, self.confirm_stop = False, True      # and then: leave the radio on?
+                else:
+                    self.quit = True
             elif k in ('n', 'N', '\x1b', curses.KEY_F10, curses.KEY_F8):
                 self.confirm_quit = False
+            self.dirty = True
+            return
+        if self.confirm_stop:
+            if k in ('y', 'Y', '\n'):             # keep it running: it keeps listening, the next window picks it up
+                self.keep_daemon = True
+                self.quit = True
+            elif k in ('n', 'N'):                 # switch the radio off too
+                self.keep_daemon = False
+                self.stop_daemon_on_quit = True
+                self.quit = True
+            elif k == '\x1b':                     # Esc: not quitting after all
+                self.confirm_stop = False
             self.dirty = True
             return
         if k in self.QUIT_KEYS:
@@ -3630,7 +3662,7 @@ class UiMixin:
             return
         if isinstance(k, str) and len(k) == 2 and k[0] == '\x1b':
             return                            # any other Alt combination does nothing
-        if isinstance(k, str) and not self.confirm_quit and not self.confirm_remove and not self.letters_are_text():
+        if isinstance(k, str) and not self.confirm_quit and not self.confirm_stop and not self.confirm_remove and not self.letters_are_text():
             if k == 'g':
                 if not self.pending_g:
                     self.pending_g = True             # first g: wait for the second
@@ -3708,7 +3740,7 @@ class UiMixin:
         if self.advert_menu_open:
             await self.handle_advert_key(k)
             return
-        if (isinstance(k, str) and k in ('4', '5', '6', '7', '8') and self.focus != 'input' and not self.settings_open
+        if (cardputer_keyboard() and isinstance(k, str) and k in ('4', '5', '6', '7', '8') and self.focus != 'input' and not self.settings_open
                 and not self.buf):                               # the keys under the screen, without Fn, when not typing
             k = (curses.KEY_F4, curses.KEY_F5, curses.KEY_F6, curses.KEY_F7, curses.KEY_F8)[int(k) - 4]
         if k in (curses.KEY_F8, curses.KEY_F10):                  # Quit
@@ -3936,11 +3968,12 @@ class UiMixin:
         """The function-key bar as (x, width, text). The built-in keyboard has five keys (4 to 8) fully under
         the screen, so the bar is five slots in a row, each name centred over its key; Fn+4 ... Fn+8 press them.
         A normal (wide) terminal gets a left-aligned bar with the key names instead ('F1 Help  F2 Options ...')."""
-        if w >= 70:                                   # a normal terminal: left-aligned, with the usual function keys
+        if w >= 70 or not cardputer_keyboard():       # a normal terminal: left-aligned, with the usual function keys
             keys = ('F1', 'F2', 'F6', 'F7', 'F10')        # F1 / F2 / F10 do the same as F4 / F5 / F8
+            short_names = w < 50                          # a small window: the short names fit
             out, x = [], 0
-            for i, (long, _short) in enumerate(self.BAR):
-                text = f' {keys[i]} {long} '
+            for i, (long, short) in enumerate(self.BAR):
+                text = f' {keys[i]} {short if short_names else long} '
                 out.append((x, len(text), text))
                 x += len(text) + 1
             return out
@@ -4091,6 +4124,11 @@ class UiMixin:
             curses.curs_set(0)
         if self.confirm_quit:
             msg = ' Quit? [y/n] '
+            y0, x0 = h // 2, max(0, (w - len(msg)) // 2)
+            scr.addnstr(y0, x0, msg, w - 1 - x0, theme_REV | curses.A_BOLD)
+            curses.curs_set(0)
+        if self.confirm_stop:
+            msg = ' Keep radio running? [y/n] '
             y0, x0 = h // 2, max(0, (w - len(msg)) // 2)
             scr.addnstr(y0, x0, msg, w - 1 - x0, theme_REV | curses.A_BOLD)
             curses.curs_set(0)
@@ -4284,6 +4322,8 @@ class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMi
         self.radio_lock = asyncio.Lock()     # the library can't tell concurrent replies apart
         self.kill = ''                       # readline kill ring (one slot)
         self.confirm_quit = False
+        self.confirm_stop = False            # second quit question: the last window, switch the radio off too?
+        self.stop_daemon_on_quit = False
         self.set_edit: str | None = None     # text being edited, None when not editing
         LOG.sink = self.on_log_record        # status messages and library logs go to the Log entry
         for rec in list(LOG.records):
@@ -5080,6 +5120,8 @@ async def run(scr, args):
         saver.cancel()
         app.sync_history()
         await app.disconnect()
+        if app.stop_daemon_on_quit:
+            await asyncio.to_thread(stop_daemon_quietly)
 
 # ======================================================================
 # command line (no screen): send, read, contacts, ...

@@ -97,8 +97,10 @@ On a small screen (under about 60 columns) the title bar shows just the conversa
 CardputerZero itself (`58%+`, the plus means charging) and the connection state; messages drop their `HH:MM`
 prefix (Enter shows the time in the details); and the function-key bar is five slots,
 each centred above the keyboard key that presses it (`Fn`+4 to 8, the five keys that sit fully under the
-screen: Help, Options, Actions, Advert, Quit; Tab and Enter work too). A normal terminal (70+ columns) gets a left-aligned bar
-(`F1 Help  F2 Options  F6 Actions  F7 Advert  F10 Quit`). `F1`/`F2`/`F10` work on the Cardputer too, `F3` connects or disconnects, `F9` shows the radio log.
+screen: Help, Options, Actions, Advert, Quit; Tab and Enter work too). Only the Cardputer's own terminal gets that
+layout (and the plain `4`-`8` digit shortcuts); an ssh session, even in a small window, or any terminal of 70+ columns
+gets a left-aligned bar (`F1 Help  F2 Options  F6 Actions  F7 Advert  F10 Quit`, shorter names under 50 columns).
+The program decides by `SSH_CONNECTION`/`SSH_TTY` and the Cardputer's 5V LED; `CARDPUTER_MC_KEYBOARD=1` (or `0`) forces it. `F1`/`F2`/`F10` work on the Cardputer too, `F3` connects or disconnects, `F9` shows the radio log.
 
 The list on the left takes a quarter of the width (10 to 24 columns): a wide terminal keeps the full list, the
 built-in 45-column screen gives the messages 33 columns instead of 20.
@@ -114,8 +116,9 @@ SSH session at the same time: each window has its own cursor and input line, the
 the message history (merged through `history.json`, so a message sent in one window shows up in the other within
 a few seconds; `/clear` clears it everywhere). `mcorectl --tcp 127.0.0.1:5001` can use the same daemon.
 
-- The daemon switches the radio off 20 seconds after the last window closes. **Detach** (Options, or `/detach on`; `/keep` is the same) keeps it running, so
-  messages keep arriving while no window is open; the next window to connect gets everything that came in.
+- When you quit the last window it asks a second question, "Keep radio running?" (y or Enter keeps it, n switches it off). If it
+  keeps running, messages keep arriving while no window is open, and the next window to connect gets everything that came
+  in. Ctrl-Q quits at once without asking; then `/keep on|off` (or `cardputer-mc keep`) decides whether the radio stays on.
 - **`/stop`** (or `cardputer-mc stop`) switches the radio off for good; `cardputer-mc status` tells whether it runs.
   `check` and `uninstall` need the radio to themselves, so stop it first.
 - Not shared between windows: the cursor, the unread counts, the Log and Radio lists, and the UI settings file
@@ -170,9 +173,9 @@ cardputer-mc keep off       # back to: the daemon stops a minute after the last 
 cardputer-mc stop           # switch the radio off for good
 ```
 
-With detach on (`keep on`) the Cardputer terminal is free for other things while the radio keeps listening; messages that arrive
+With `keep on` the Cardputer terminal is free for other things while the radio keeps listening; messages that arrive
 meanwhile wait in the daemon's inbox and show up in the next window, in `cardputer-mc read` or `cardputer-mc listen`.
-The price is some power: the radio's 5V rail stays on and the radio keeps listening. `/detach on|off` and `/stop` do the same inside the chat.
+The price is some power: the radio's 5V rail stays on and the radio keeps listening. `/keep on|off` and `/stop` do the same inside the chat.
 
 **Sound.** The daemon plays a chime on the Cardputer's speaker when a message arrives, also with no window open:
 two rising tones for a private message, one lower tone for a channel message. `cardputer-mc sound off|private|all|test`
