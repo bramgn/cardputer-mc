@@ -537,19 +537,41 @@ def install_client():
 
 
 def apply_pi_patches():
-    """Local fixes on top of the pinned meshcore-pi (MeshCore >= 1.11 path hashes, TX power, ...), in order; each is
-    skipped when it is already applied (a reverse check)."""
-    for name, patch in (('multi-byte path hashes, RX race', PI_PATCH), ('ACKs with extra bytes', PI_PATCH_ACK),
-                        ('TX power command (applied between packets, max 22)', PI_PATCH_TX),
-                        ('binary requests: status, telemetry, neighbours of repeaters', PI_PATCH_BIN),
-                        ('import contact (meshcore:// links)', PI_PATCH_IMPORT),
-                        ('radio receive thread sleeps instead of using a whole core', PI_PATCH_RX)):
-        if subprocess.run(['git', '-C', PI_DIR, 'apply', '--check', '-R', '-'], input=patch, text=True,
-                          capture_output=True).returncode == 0:
-            print(f'  fix already applied: {name}')
-        else:
-            subprocess.run(['git', '-C', PI_DIR, 'apply', '--whitespace=nowarn', '-'], input=patch, text=True, check=True)
-            print(f'  applied fix: {name}')
+    """Local fixes on top of the pinned meshcore-pi (MeshCore >= 1.11 path hashes, TX power, ...). The patches are written
+    one after the other, so a tree that has them all cannot be told apart patch by patch. Instead: build the expected
+    tree (pinned commit + every patch) in a temporary directory; when the tracked files of PI_DIR match it nothing is
+    done, otherwise PI_DIR's tracked files are reset to the pinned commit and the patches are applied in order."""
+    import shutil
+    import tempfile
+    patches = (('multi-byte path hashes, RX race', PI_PATCH), ('ACKs with extra bytes', PI_PATCH_ACK),
+               ('TX power command (applied between packets, max 22)', PI_PATCH_TX),
+               ('binary requests: status, telemetry, neighbours of repeaters', PI_PATCH_BIN),
+               ('import contact (meshcore:// links)', PI_PATCH_IMPORT),
+               ('radio receive thread sleeps instead of using a whole core', PI_PATCH_RX))
+    tmp = tempfile.mkdtemp(prefix='cmc-pi-')
+    try:
+        tar = subprocess.run(['git', '-C', PI_DIR, 'archive', PI_COMMIT], capture_output=True, check=True).stdout
+        subprocess.run(['tar', '-x', '-C', tmp], input=tar, check=True)
+        for _name, patch in patches:
+            subprocess.run(['git', 'apply', '--whitespace=nowarn', '-'], input=patch, text=True, cwd=tmp, check=True, capture_output=True)
+        tracked = subprocess.run(['git', '-C', PI_DIR, 'ls-files'], capture_output=True, text=True, check=True).stdout.split('\n')
+        same = True
+        for rel in filter(None, tracked):
+            try:
+                with open(os.path.join(PI_DIR, rel), 'rb') as f1, open(os.path.join(tmp, rel), 'rb') as f2:
+                    same = same and f1.read() == f2.read()
+            except OSError:
+                same = False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if same:
+        print('  all fixes already applied')
+        return
+    print('  meshcore-pi is not at the expected fixes: resetting its tracked files to the pinned commit first')
+    _run(['git', '-C', PI_DIR, 'checkout', '-q', '-f', PI_COMMIT])
+    for name, patch in patches:
+        subprocess.run(['git', '-C', PI_DIR, 'apply', '--whitespace=nowarn', '-'], input=patch, text=True, check=True)
+        print(f'  applied fix: {name}')
 
 
 def install(argv):
