@@ -148,6 +148,22 @@ Everything lands in the shared history, so a running chat window shows messages 
 (with the delivery mark) and `listen`/`read` also collect what arrived while no window was open.
 Repeaters are not a target for `send`: they take commands, which stay in the chat (Enter on the repeater).
 
+## Using a MeshCore USB companion (a Heltec ...) instead of the Cap-LoRa
+
+A board running MeshCore's USB companion firmware speaks the same frames as meshcore-pi, over a serial line, so the
+radio daemon can use it as its radio. On the machine it is plugged into:
+
+```
+cardputer-mc --serial /dev/ttyUSB0                  # the chat, with that board as the radio
+cardputer-mc --serial /dev/ttyUSB0 up --keep        # or only the daemon; then the commands work as usual
+cardputer-mc --serial /dev/ttyUSB0 ping NAME        # send, read, contacts, info ... all of them
+```
+
+(`CARDPUTER_MC_SERIAL` sets it for good; the daemon is started once with it and keeps using that port until `cardputer-mc stop`.)
+Not available with `--remote`, and `check` is for the Cap-LoRa wiring only. The board's firmware decides what it can do:
+TX power, add contact and status requests have been used with meshcore-pi, so test them on your board. Tested with a
+Heltec V3 (v1.18.0): info, contacts, send with acknowledgement, zero-hop ping to a repeater.
+
 ## Using the radio from another computer
 
 On a PC, install only the client part and point it at the Cardputer:

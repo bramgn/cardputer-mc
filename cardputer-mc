@@ -4588,7 +4588,7 @@ class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMi
         return self.mc.contacts if self.mc else self.contact_cache
 
     def target(self) -> str:
-        return f'radio on {REMOTE.split("@")[-1]}' if REMOTE else 'local radio'
+        return f'radio on {REMOTE.split("@")[-1]}' if REMOTE else f'radio on {SERIAL}' if SERIAL else 'local radio'
 
     def need_radio(self) -> bool:
         if self.mc is None:
@@ -4780,7 +4780,7 @@ def persist_txpower(dbm: int):
 class Daemon:
     def __init__(self, upstream=None):
         self.upstream = upstream              # (host, port) of a companion to use as is (tests); else run meshcore-pi
-        self.radio = None if upstream else LocalRadio()
+        self.radio = None if (upstream or SERIAL) else LocalRadio()
         self.clients: set = set()
         self.inbox: collections.deque = collections.deque(self._load_inbox())     # messages nobody has fetched
         self.lock = asyncio.Lock()            # one request to the radio at a time
@@ -4968,11 +4968,23 @@ class Daemon:
         try:
             if self.radio:
                 await self.radio.start()
-            host, port = self.upstream or (HOST, PORT)
-            self.up_reader, self.up_writer = await asyncio.open_connection(host, port)
+            if SERIAL:                        # a USB companion speaks the same frames as meshcore-pi, over a serial line
+                try:
+                    import serial_asyncio_fast as serial_asyncio      # what recent meshcore versions use
+                except ImportError:
+                    import serial_asyncio
+                self.up_reader, self.up_writer = await serial_asyncio.open_serial_connection(url=SERIAL, baudrate=115200)
+                log.info('using the USB companion on %s', SERIAL)
+                await asyncio.sleep(1.5)      # opening the port can reset the board
+            else:
+                host, port = self.upstream or (HOST, PORT)
+                self.up_reader, self.up_writer = await asyncio.open_connection(host, port)
             tasks.append(asyncio.create_task(self._read_upstream()))
             async with self.lock:
-                hello = await self._request(b'\x01\x03      cmcd')        # app start
+                for _ in range(3 if SERIAL else 1):
+                    hello = await self._request(b'\x01\x03      cmcd')    # app start
+                    if hello and hello[0][0] == 5:
+                        break
                 if not hello or hello[0][0] != 5:
                     raise RuntimeError('the radio did not answer')
                 await self._request(b'\x16\x03')                           # device query: protocol 3 (SNR with messages)
@@ -5018,6 +5030,7 @@ def daemon_pid():
 
 
 REMOTE = None                      # [user@]host of the machine that has the radio (set by --remote), else None
+SERIAL = os.environ.get('CARDPUTER_MC_SERIAL') or None     # serial port of a USB companion (a Heltec ...), set by --serial
 REMOTE_PORT = int(os.environ.get('CARDPUTER_MC_REMOTE_PORT', '5001'))
 TUNNEL = None
 
@@ -5076,7 +5089,10 @@ async def ensure_daemon():
         if await daemon_reachable():
             return
         raise RuntimeError(f'radio on {REMOTE} not reachable')
-    if not available():
+    if SERIAL:
+        if not os.path.exists(SERIAL):
+            raise RuntimeError(f'no such serial port: {SERIAL}')
+    elif not available():
         raise RuntimeError(f'local radio not available (need {SPIDEV}); run: {APP} install')
     try:
         os.remove(STOP_MARK)
@@ -5561,6 +5577,9 @@ def main():
     ap.add_argument('--remote', metavar='[USER@]HOST', default=os.environ.get('CARDPUTER_MC_REMOTE'),
                     help='use the radio of another machine (the Cardputer): starts its radio daemon over ssh and tunnels to it '
                          '(also CARDPUTER_MC_REMOTE). On a PC set up with: install --client')
+    ap.add_argument('--serial', metavar='PORT', default=os.environ.get('CARDPUTER_MC_SERIAL'),
+                    help='use a MeshCore USB companion (a Heltec ...) on this serial port, e.g. /dev/ttyUSB0, instead of the '
+                         'Cap-LoRa: the radio daemon reads that port (also CARDPUTER_MC_SERIAL)')
     sub = ap.add_subparsers(dest='command', metavar='command', description='without a command the chat starts')
     sub.add_parser('check', help='test the SX1262 wiring (no airtime)')
     sub.add_parser('daemon', help='run the radio daemon in the foreground (chat windows start it by themselves)')
@@ -5604,6 +5623,14 @@ def main():
     sub.add_parser('uninstall', help='remove what install made')
     opts = ap.parse_args()
     command = opts.command
+    if opts.serial:
+        global SERIAL
+        if opts.remote:
+            sys.exit(f'{APP}: --serial and --remote cannot be combined (run {APP} --serial on the machine the radio is plugged into)')
+        if command == 'check':
+            sys.exit(f'{APP}: check tests the Cap-LoRa wiring, not a USB companion')
+        SERIAL = opts.serial
+        os.environ['CARDPUTER_MC_SERIAL'] = SERIAL         # the daemon, started detached, inherits it
     if opts.remote and command in ('check', 'daemon', 'up', 'stop', 'status', 'keep', 'sound'):
         sys.exit(f'{APP}: {command} works on the machine that has the radio; use: ssh {opts.remote} {APP} {command}')
     if opts.remote:
