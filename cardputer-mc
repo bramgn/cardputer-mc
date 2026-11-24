@@ -1033,6 +1033,9 @@ theme_THEMES = {
               ('green', 'default'), ('cyan', 'default'), ('red', 'default')),
     'amber': (('black', 'yellow'), ('yellow', 'black'), ('yellow', 'default'), ('white', 'default'),
               ('yellow', 'default'), ('magenta', 'default'), ('red', 'default')),
+    # the terminal's own background (dark in the Cardputer's terminal) with black bars: the original "light" theme
+    'dark': (('white', 'black'), ('white', 'blue'), ('blue', 'default'), ('default', 'default'),
+             ('green', 'default'), ('magenta', 'default'), ('red', 'default')),
     # paints its own white background (see theme_BACKGROUND), so it is light on any terminal
     'light': (('white', 'blue'), ('black', 'cyan'), ('blue', 'white'), ('red', 'white'),
               ('blue', 'white'), ('magenta', 'white'), ('red', 'white')),
@@ -1072,7 +1075,7 @@ def theme_col(c) -> int:
 
 theme_DESCRIPTIONS = {
     'blue': 'classic white-on-blue bars', 'green': 'green phosphor terminal', 'amber': 'amber CRT',
-    'light': 'dark text on a white background', 'mono': 'no colour, bold and reverse only',
+    'dark': 'the terminal\'s own colours, black bars, blue accents', 'light': 'dark text on a white background', 'mono': 'no colour, bold and reverse only',
     'vampire': 'purple and pink on dark (Dracula-ish)', 'fjord': 'cold blues and soft frost (Nord-ish)',
     'sundial': 'teal and mustard (Solarized-ish)', 'harvest': 'warm retro earth tones (Gruvbox-ish)',
     'shibuya': 'rainy neon night (Tokyo Night-ish)', 'synthwave': 'magenta and cyan 80s grid',
