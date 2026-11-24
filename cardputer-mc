@@ -437,12 +437,13 @@ PI_PATCH_RX = r'''diff --git a/interfaces/lorainterface.py b/interfaces/lorainte
      def rx_thread(self):
          logger.debug("LoRa rx thread listening")
  
-@@ -147,6 +147,8 @@
+@@ -147,6 +147,9 @@
      
          s = ["STATUS_DEFAULT", "STATUS_TX_WAIT", "STATUS_TX_TIMEOUT", "STATUS_TX_DONE", "STATUS_RX_WAIT", "STATUS_RX_CONTINUOUS", "STATUS_RX_TIMEOUT", "STATUS_RX_DONE", "STATUS_HEADER_ERR", "STATUS_CRC_ERR", "STATUS_CAD_WAIT", "STATUS_CAD_DETECTED", "STATUS_CAD_DONE"]
          while True:
-+            while not self.LoRa._statusIrq:
-+                time.sleep(0.002)
++            if self.LoRa._irq != -1:                # interrupt mode: the handler sets _statusIrq for us
++                while not self.LoRa._statusIrq:
++                    time.sleep(0.002)
              self.LoRa.wait()
  
              # Let the interrupt handler finish (not set after a transmit, hence the timeout)
