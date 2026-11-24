@@ -111,7 +111,7 @@ built-in 45-column screen gives the messages 33 columns instead of 20.
 
 ## One radio, several windows
 
-The radio is owned by a small background process, the radio daemon (`cardputer-mc daemon`), that the chat starts by
+The radio is owned by a small background process, the radio daemon (`cardputer-mc radio daemon`), that the chat starts by
 itself when it is not running. Any number of chat windows connect to it, for example the Cardputer's own CLI and an
 SSH session at the same time: each window has its own cursor and input line, they share the radio, the contacts and
 the message history (merged through `history.json`, so a message sent in one window shows up in the other within
@@ -119,8 +119,8 @@ a few seconds; `/clear` clears it everywhere). `mcorectl --tcp 127.0.0.1:5001` c
 
 - When you quit the last window it asks a second question, "Keep radio running?" (y or Enter keeps it, n switches it off). If it
   keeps running, messages keep arriving while no window is open, and the next window to connect gets everything that came
-  in. Ctrl-Q quits at once without asking; then `/keep on|off` (or `cardputer-mc keep`) decides whether the radio stays on.
-- **`/stop`** (or `cardputer-mc stop`) switches the radio off for good; `cardputer-mc status` tells whether it runs.
+  in. Ctrl-Q quits at once without asking; then `/keep on|off` (or `cardputer-mc radio keep`) decides whether the radio stays on.
+- **`/stop`** (or `cardputer-mc radio stop`) switches the radio off for good; `cardputer-mc radio status` tells whether it runs.
   `check` and `uninstall` need the radio to themselves, so stop it first.
 - Not shared between windows: the cursor, the unread counts, the Log and Radio lists, and the UI settings file
   (the last window to change a setting wins).
@@ -140,13 +140,35 @@ cardputer-mc channels
 cardputer-mc info                       # name, key, frequency, battery (--json)
 cardputer-mc advert [--flood]
 cardputer-mc ping Repeater78 [-c 4] [-i 2]  # (-c 0: until Ctrl-C) zero-hop trace to a repeater or room server: SNR + round trip; exit 0 if any answered
-cardputer-mc up                         # start the daemon and exit
+cardputer-mc radio up                   # start the daemon and exit
 ```
 
 A target is a contact or channel name: exact, else the start, else any part of it (`#name` = channel).
 Everything lands in the shared history, so a running chat window shows messages sent from the command line
 (with the delivery mark) and `listen`/`read` also collect what arrived while no window was open.
 Repeaters are not a target for `send`: they take commands, which stay in the chat (Enter on the repeater).
+
+## Radio commands and tab completion
+
+The commands that deal with the radio daemon are grouped under `radio`, like `nmcli radio`:
+
+```
+cardputer-mc radio                # same as: radio status
+cardputer-mc radio up [--keep]    # start the daemon (and keep it running with --keep)
+cardputer-mc radio stop           # stop it and switch the radio off
+cardputer-mc radio status         # running? pid, uptime, windows, messages waiting, sound
+cardputer-mc radio keep [on|off]  # stay running when the last window closes
+cardputer-mc radio sound [off|private|all|test]
+cardputer-mc radio check          # wiring test of the Cap-LoRa (no airtime)
+```
+
+The old names (`cardputer-mc stop`, `up`, `status`, `keep`, `sound`, `check`, `daemon`) still work, but are no longer listed.
+
+`install` sets up tab completion for bash, generated from the program's own options: commands, `radio` actions, options and
+the choices of `radio keep` and `radio sound`; where a contact is expected (`send`, `read`, `ping`) it offers the names of the
+contacts and channels, from a radio daemon that is already running (completing a word never starts the radio). For a
+machine that is already set up: `cardputer-mc completion --install` (or `source <(cardputer-mc completion)` for this shell).
+`cardputer-mc update` refreshes it when it was installed.
 
 ## Updating
 
@@ -156,7 +178,7 @@ cardputer-mc update            # fast-forward this git checkout, re-apply the me
 ```
 
 `update` only moves forward (`git merge --ff-only`) and refuses when the checkout has local changes. It restarts the radio
-daemon only when no window is open; otherwise it says what to run when you are done (`cardputer-mc stop; cardputer-mc up`;
+daemon only when no window is open; otherwise it says what to run when you are done (`cardputer-mc radio stop; cardputer-mc radio up`;
 a daemon started with `--serial` needs that option again). It is never automatic: the chat looks once a day (a `git ls-remote`
 of the public repository, 10 seconds after it starts) and puts `update available: run cardputer-mc update` in the status
 line. Turn the look off with `CARDPUTER_MC_NO_UPDATE_CHECK=1` or `"update_check": false` in `~/.config/cardputer-mc/config.json`.
@@ -172,7 +194,7 @@ cardputer-mc --serial /dev/ttyUSB0 up --keep        # or only the daemon; then t
 cardputer-mc --serial /dev/ttyUSB0 ping NAME        # send, read, contacts, info ... all of them
 ```
 
-(`CARDPUTER_MC_SERIAL` sets it for good; the daemon is started once with it and keeps using that port until `cardputer-mc stop`.)
+(`CARDPUTER_MC_SERIAL` sets it for good; the daemon is started once with it and keeps using that port until `cardputer-mc radio stop`.)
 Not available with `--remote`, and `check` is for the Cap-LoRa wiring only. The board's firmware decides what it can do:
 TX power, add contact and status requests have been used with meshcore-pi, so test them on your board. Tested with a
 Heltec V3 (v1.18.0): info, contacts, send with acknowledgement, zero-hop ping to a repeater.
@@ -188,7 +210,7 @@ cardputer-mc --remote bram@cardputer send Yoshi hi    # every command above work
 ```
 
 `--remote` (or `CARDPUTER_MC_REMOTE=user@host`) logs in over ssh (key based, no password prompt), starts the radio
-daemon there with `cardputer-mc up` if needed, and forwards its port to the PC for as long as the command runs. The
+daemon there with `cardputer-mc radio up` if needed, and forwards its port to the PC for as long as the command runs. The
 daemon has no password of its own and only listens on the Cardputer's localhost: do not make it listen on the network,
 let the ssh login be the protection. The Cardputer needs `cardputer-mc` installed and `~/.local/bin/cardputer-mc`
 in place. The PC keeps its own chat history (it is not shared with the Cardputer's windows), and the title bar
@@ -197,10 +219,10 @@ shows no battery (the PC's battery says nothing about the radio's).
 ## Without a window: the daemon in the background
 
 ```
-cardputer-mc up --keep      # start the radio daemon, detached, and keep it running when no window is open
-cardputer-mc status         # running? pid, uptime, open windows, messages waiting, sound
-cardputer-mc keep off       # back to: the daemon stops a minute after the last window
-cardputer-mc stop           # switch the radio off for good
+cardputer-mc radio up --keep      # start the radio daemon, detached, and keep it running when no window is open
+cardputer-mc radio status         # running? pid, uptime, open windows, messages waiting, sound
+cardputer-mc radio keep off       # back to: the daemon stops a minute after the last window
+cardputer-mc radio stop           # switch the radio off for good
 ```
 
 With `keep on` the Cardputer terminal is free for other things while the radio keeps listening; messages that arrive
@@ -208,7 +230,7 @@ meanwhile wait in the daemon's inbox and show up in the next window, in `cardput
 The price is some power: the radio's 5V rail stays on and the radio keeps listening. `/keep on|off` and `/stop` do the same inside the chat.
 
 **Sound.** The daemon plays a chime on the Cardputer's speaker when a message arrives, also with no window open:
-two rising tones for a private message, one lower tone for a channel message. `cardputer-mc sound off|private|all|test`
+two rising tones for a private message, one lower tone for a channel message. `cardputer-mc radio sound off|private|all|test`
 (or `/sound` in the chat); the default is `private` (channels can be busy). Repeater replies and bursts within two
 seconds stay quiet. It needs `aplay` (alsa-utils) and uses the first sound card that is not HDMI; set
 `CARDPUTER_MC_SOUND_DEVICE=plughw:1,0` to pick another.
@@ -270,7 +292,7 @@ Back up `config.toml`: it holds the node's private key.
 ## Check the wiring
 
 ```bash
-cardputer-mc check
+cardputer-mc radio check
 ```
 
 Tests this board's SX1262 wiring in a few seconds, without sending anything: it switches the module's 5V supply on

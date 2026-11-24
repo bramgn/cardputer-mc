@@ -516,6 +516,13 @@ def _migrate_old_name():
         print(f'  removed old command {old_link}')
 
 
+def _install_completion():
+    """Tab completion for bash, written by the venv's Python (the argument parser lives in the part of this file that
+    needs the venv). Failing to do so is not an error."""
+    r = subprocess.run([VENV_PY, os.path.realpath(__file__), 'completion', '--install'], capture_output=True, text=True)
+    print('  tab completion: ' + (r.stdout.strip() if r.returncode == 0 else 'not installed (' + (r.stderr.strip() or r.stdout.strip()) + ')'))
+
+
 def install_client():
     os.makedirs(HOME_DIR, exist_ok=True)
     print('1/2 python venv (client only: meshcore library)')
@@ -532,6 +539,7 @@ def install_client():
             os.remove(link)
         os.symlink(target, link)
     print(f'  {link} -> {target}')
+    _install_completion()
     print(f'\nDone. Run: {APP} --remote USER@HOST   (the radio machine needs {APP} installed; ssh must log in without a password)')
     return 0
 
@@ -641,6 +649,7 @@ def install(argv):
             os.remove(link)
         os.symlink(target, link)
     print(f'  {link} -> {target}')
+    _install_completion()
     print(f'\nDone. Run: {APP}   (make sure ~/.local/bin is on your PATH)')
     return 0
 
@@ -684,7 +693,7 @@ def uninstall(argv):
         return 0
     pids = _running_pids()
     if pids:
-        raise SystemExit(f'{APP} or its radio daemon is still running (pid {", ".join(map(str, pids))}); close it, or run: {APP} stop')
+        raise SystemExit(f'{APP} or its radio daemon is still running (pid {", ".join(map(str, pids))}); close it, or run: {APP} radio stop')
 
     remove = [os.path.join(home, n) for n in sorted(os.listdir(home))
               if not (opts.keep_identity and n in IDENTITY_FILES)]
@@ -743,7 +752,7 @@ def check() -> int:
 
     pids = _running_pids()
     if pids:
-        report(False, f'{APP} or its radio daemon is running (pid {", ".join(map(str, pids))}); close it, or run: {APP} stop')
+        report(False, f'{APP} or its radio daemon is running (pid {", ".join(map(str, pids))}); close it, or run: {APP} radio stop')
         return 1
     dev = f'/dev/spidev{spi}.{cs}'
     if not os.path.exists(dev):
@@ -873,8 +882,8 @@ def _bootstrap():
         print(f'{APP} {__version__}')
         sys.exit(0)
     if sys.argv[1:2] in (['-h'], ['--help']):
-        print(f'usage: {APP} [--remote [USER@]HOST]\n       {APP} [--remote HOST] send TARGET TEXT... | read [TARGET] | contacts | addcontact LINK | channels | info | advert | ping TARGET | listen\n'
-              f'       {APP} check | up [--keep] | keep [on|off] | sound [off|private|all|test] | stop | status | update [--check]\n       {APP} install [--client] [--name NAME] [--key HEX] [-y]\n'
+        print(f'usage: {APP} [--remote [USER@]HOST | --serial PORT]\n       {APP} [--remote HOST] send TARGET TEXT... | read [TARGET] | contacts | addcontact LINK | channels | info | advert | ping TARGET | listen\n'
+              f'       {APP} radio up [--keep] | stop | status | keep [on|off] | sound [off|private|all|test] | check\n       {APP} update [--check] | completion [--install]\n       {APP} install [--client] [--name NAME] [--key HEX] [-y]\n'
               f'       {APP} uninstall [--keep-identity] [--purge] [-y]\n       {APP} --version   ({APP} COMMAND --help for details)\n')
         print(__doc__.split('State lives')[0].strip())
         sys.exit(0)
@@ -1900,7 +1909,7 @@ class ConnectionMixin:
         log.warning('connection lost; reconnecting')
         await self.disconnect('connection lost')
         if stop_requested():                  # `cardputer-mc stop` was run somewhere: leave the radio off
-            self.status = 'the radio was stopped (cardputer-mc stop); F3 starts it again'
+            self.status = 'the radio was stopped (cardputer-mc radio stop); F3 starts it again'
             self.dirty = True
             return
         for n, wait in enumerate((2, 5, 15, 30, 60), 1):
@@ -5139,7 +5148,7 @@ async def ensure_daemon():
     os.makedirs(HOME_DIR, exist_ok=True)
     start_at = os.path.getsize(DAEMON_LOG) if os.path.exists(DAEMON_LOG) else 0
     with open(DAEMON_LOG, 'ab') as out:
-        proc = subprocess.Popen([PI_PYTHON, os.path.realpath(__file__), 'daemon'], cwd=HOME_DIR, stdin=subprocess.DEVNULL,
+        proc = subprocess.Popen([PI_PYTHON, os.path.realpath(__file__), 'radio', 'daemon'], cwd=HOME_DIR, stdin=subprocess.DEVNULL,
                                 stdout=out, stderr=out, start_new_session=True)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + START_TIMEOUT + 15
@@ -5153,7 +5162,7 @@ async def ensure_daemon():
 
 
 def stop_requested() -> bool:
-    """True just after `cardputer-mc stop`: the windows must not start the radio again."""
+    """True just after `cardputer-mc radio stop`: the windows must not start the radio again."""
     try:
         return time.time() - os.path.getmtime(STOP_MARK) < 30
     except OSError:
@@ -5263,6 +5272,8 @@ def cmd_update(opts) -> int:
         print(f'{APP}: {os.path.realpath(__file__)} is not inside a git checkout; clone {UPDATE_REPO} to update it')
         return 1
     if opts.apply:                                    # second step, run by the new code after the merge
+        if os.path.exists(COMPLETION_FILE):
+            write_completion(build_parser())            # the commands may have changed
         if os.path.isdir(os.path.join(PI_DIR, '.git')):
             print('meshcore-pi fixes:')
             apply_pi_patches()
@@ -5277,7 +5288,7 @@ def cmd_update(opts) -> int:
             windows = 0
         if windows:
             print(f'the radio daemon (pid {pid}) keeps the old code until it restarts: close the {windows} window(s), '
-                  f'then run: {APP} stop; {APP} up')
+                  f'then run: {APP} radio stop; {APP} radio up')
             return 0
         rc, message = stop_daemon_quietly()
         print(message)
@@ -5314,6 +5325,141 @@ def cmd_update(opts) -> int:
     except OSError:
         pass
     os.execv(sys.executable, [sys.executable, os.path.realpath(__file__), 'update', '--apply'])       # continue with the new code
+
+
+# ======================================================================
+# tab completion (bash)
+# ======================================================================
+
+COMPLETION_FILE = os.path.expanduser('~/.local/share/bash-completion/completions/' + APP)     # loaded on demand by bash-completion
+
+
+def completion_script(ap: argparse.ArgumentParser) -> str:
+    """A bash completion made from the argument parser itself: commands, `radio` actions, options, choices, and contact
+    names (from the running radio daemon; nothing is started for it) where a TARGET is expected."""
+    def spec(parser):
+        opts, choices, target, valued = [], [], False, []
+        for a in parser._actions:
+            if a.help == argparse.SUPPRESS or isinstance(a, (argparse._HelpAction, argparse._VersionAction, argparse._SubParsersAction)):
+                continue
+            if a.option_strings:
+                opts += a.option_strings
+                if a.nargs != 0:
+                    valued += a.option_strings
+            elif a.choices:
+                choices += [str(c) for c in a.choices]
+            elif a.dest == 'target':
+                target = True
+        return opts, choices, target, valued
+
+    def visible(subparsers):
+        return [a.dest for a in subparsers._choices_actions]
+
+    top = next(a for a in ap._actions if isinstance(a, argparse._SubParsersAction))
+    commands = visible(top)
+    glob_opts = [o for a in ap._actions if a.option_strings and not isinstance(a, argparse._HelpAction) for o in a.option_strings]
+    valued_all = ['--remote', '--serial']
+    arms = []
+    for name in commands:
+        parser = top.choices[name]
+        sub = next((a for a in parser._actions if isinstance(a, argparse._SubParsersAction)), None)
+        if sub is not None:                                              # radio: its actions are the first word
+            arms.append((name, [], visible(sub), False, []))
+            for action in visible(sub):
+                o, c, t, v = spec(sub.choices[action])
+                valued_all += v
+                arms.append((f'{name} {action}', o, c, t, []))
+            continue
+        o, c, t, v = spec(parser)
+        valued_all += v
+        arms.append((name, o, c, t, []))
+    out = [f'# bash completion for {APP}: source <({APP} completion), or {APP} completion --install',
+           f'_{APP.replace("-", "_")}() {{',
+           '    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}',
+           '    local i w cmd= sub= npos=0 key opts= choices= subs= target=0 n',
+           '    COMPREPLY=()',
+           '    case $prev in',
+           '        --remote) return ;;',
+           '        --serial) COMPREPLY=($(compgen -G "/dev/tty*" -- "$cur")); return ;;',
+           '    esac',
+           '    for ((i = 1; i < COMP_CWORD; i++)); do',
+           '        w=${COMP_WORDS[i]}',
+           '        case $w in',
+           f'            {"|".join(sorted(set(valued_all)))}) ((i++)); continue ;;',
+           '            -*) continue ;;',
+           '        esac',
+           '        if [[ -z $cmd ]]; then cmd=$w',
+           '        elif [[ $cmd == radio && -z $sub ]]; then sub=$w',
+           '        else ((npos++)); fi',
+           '    done',
+           '    key=$cmd${sub:+ $sub}',
+           '    case "$key" in',
+           f'        "") opts="{" ".join(glob_opts + ["-h", "--help"])}"; subs="{" ".join(commands)}" ;;']
+    for key, o, c, t, _ in arms:
+        sub_words = " ".join(c) if key == 'radio' else ''
+        ch = '' if key == 'radio' else " ".join(c)
+        out.append(f'        "{key}") opts="{" ".join(o)}"; choices="{ch}"; subs="{sub_words}"; target={1 if t else 0} ;;')
+    out += ['        *) return ;;',
+            '    esac',
+            '    if [[ $cur == -* ]]; then',
+            '        COMPREPLY=($(compgen -W "$opts" -- "$cur"))',
+            '    elif [[ -n $subs && -z $cmd ]]; then',
+            '        COMPREPLY=($(compgen -W "$subs" -- "$cur"))',
+            '    elif [[ $cmd == radio && -z $sub ]]; then',
+            '        COMPREPLY=($(compgen -W "$subs" -- "$cur"))',
+            '    elif [[ $target == 1 && $npos -eq 0 ]]; then',
+            "        local IFS=$'\\n'",
+            '        for n in $(command "${COMP_WORDS[0]}" __names 2>/dev/null); do',
+            '            [[ ${n,,} == "${cur,,}"* ]] && COMPREPLY+=("$(printf %q "$n")")',
+            '        done',
+            '    elif [[ -n $choices && $npos -eq 0 ]]; then',
+            '        COMPREPLY=($(compgen -W "$choices" -- "$cur"))',
+            '    fi',
+            '}',
+            f'complete -F _{APP.replace("-", "_")} {APP}', '']
+    return '\n'.join(out)
+
+
+def write_completion(ap: argparse.ArgumentParser) -> str | None:
+    """Install the completion for this user; returns the path, or None when it could not be written."""
+    try:
+        os.makedirs(os.path.dirname(COMPLETION_FILE), exist_ok=True)
+        with open(COMPLETION_FILE, 'w') as f:
+            f.write(completion_script(ap))
+        return COMPLETION_FILE
+    except OSError:
+        return None
+
+
+def cmd_completion(opts, ap) -> int:
+    if opts.install:
+        path = write_completion(ap)
+        if path is None:
+            print(f'{APP}: could not write {COMPLETION_FILE}')
+            return 1
+        print(f'wrote {path} (bash-completion loads it in new shells; or: source {path})')
+        return 0
+    sys.stdout.write(completion_script(ap))
+    return 0
+
+
+def cmd_names() -> int:
+    """Contact and channel names, one per line, for the tab completion. Only asks a radio daemon that is already
+    running (completing a word must not start the radio)."""
+    if REMOTE or not asyncio.run(daemon_reachable()):
+        return 0
+
+    async def names(_a):
+        app = await cli_app()
+        try:
+            for _k, name, _c in cli_contacts(app):
+                print(name)
+            for _i, name in app.channels:
+                print('#' + name.lstrip('#'))
+        finally:
+            await cli_finish(app)
+        return 0
+    return run_cli(names, None)
 
 
 # ======================================================================
@@ -5731,7 +5877,22 @@ def terminfo_without_ech_rep():
     os.environ['TERM'] = name
 
 
-def main():
+def _add_radio_parsers(add):
+    """The commands for the radio daemon and its radio; `add(name, help)` makes the parser (the same specs serve
+    `cardputer-mc radio NAME` and the old top-level names, which stay as hidden aliases)."""
+    add('check', 'test the SX1262 wiring (no airtime)')
+    add('daemon', 'run the radio daemon in the foreground (chat windows start it by themselves)')
+    sp = add('up', 'start the radio daemon if it is not running, then exit')
+    sp.add_argument('--keep', action='store_true', help='also keep it running when no window is open (like: radio keep on)')
+    sp = add('keep', 'keep the radio daemon running when no window is open: radio keep on | off (no argument: show)')
+    sp.add_argument('mode', nargs='?', choices=['on', 'off'])
+    sp = add('sound', 'chime on a new message, played by the daemon: radio sound off | private | all | test')
+    sp.add_argument('mode', nargs='?', choices=list(SOUND_MODES) + ['test'])
+    add('stop', 'stop the radio daemon and switch the radio off')
+    add('status', 'is the radio daemon running (and: pid, uptime, windows, messages waiting)')
+
+
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog=APP, description='ncurses MeshCore chat for the M5 CardputerZero with the Cap-LoRa-1262',
         epilog=f'First run: {APP} install   (sets up meshcore-pi, a venv and {PI_CONFIG})')
@@ -5743,19 +5904,10 @@ def main():
                     help='use a MeshCore USB companion (a Heltec ...) on this serial port, e.g. /dev/ttyUSB0, instead of the '
                          'Cap-LoRa: the radio daemon reads that port (also CARDPUTER_MC_SERIAL)')
     sub = ap.add_subparsers(dest='command', metavar='command', description='without a command the chat starts')
-    sub.add_parser('check', help='test the SX1262 wiring (no airtime)')
-    sub.add_parser('daemon', help='run the radio daemon in the foreground (chat windows start it by themselves)')
-    sp = sub.add_parser('up', help='start the radio daemon if it is not running, then exit')
-    sp.add_argument('--keep', action='store_true', help='also keep it running when no window is open (like: keep on)')
-    sp = sub.add_parser('keep', help='keep the radio daemon running when no window is open: keep on | off (no argument: show)')
-    sp.add_argument('mode', nargs='?', choices=['on', 'off'])
-    sp = sub.add_parser('sound', help='chime on a new message, played by the daemon: sound off | private | all | test')
-    sp.add_argument('mode', nargs='?', choices=list(SOUND_MODES) + ['test'])
-    sub.add_parser('stop', help='stop the radio daemon and switch the radio off')
-    sub.add_parser('status', help='is the radio daemon running')
-    sp = sub.add_parser('update', help='fetch the newest version from GitHub, re-apply the meshcore-pi fixes, restart an idle daemon')
-    sp.add_argument('--check', action='store_true', help='only say whether there is something new (exit 10 when there is)')
-    sp.add_argument('--apply', action='store_true', help=argparse.SUPPRESS)
+    sp = sub.add_parser('radio', help='the radio daemon: up, stop, status, keep, sound, check (`radio` alone: status)')
+    rsub = sp.add_subparsers(dest='radio_command', metavar='action')
+    _add_radio_parsers(lambda name, help: rsub.add_parser(name, help=help))
+    _add_radio_parsers(lambda name, help: sub.add_parser(name))        # the old names, no longer listed
     sp = sub.add_parser('send', help='send a message: send Yoshi "hello", send "#test" hi there (TEXT - reads stdin)')
     sp.add_argument('target', help='contact or channel name (a leading # = channel; a part of the name is enough)')
     sp.add_argument('text', nargs='+')
@@ -5784,10 +5936,34 @@ def main():
     sp.add_argument('--count', type=int, metavar='N', help='stop after N messages')
     sp.add_argument('--seconds', type=float, metavar='SEC', help='stop after this long')
     sp.add_argument('--dates', action='store_true')
+    sp = sub.add_parser('update', help='fetch the newest version from GitHub, re-apply the meshcore-pi fixes, restart an idle daemon')
+    sp.add_argument('--check', action='store_true', help='only say whether there is something new (exit 10 when there is)')
+    sp.add_argument('--apply', action='store_true', help=argparse.SUPPRESS)
+    sp = sub.add_parser('completion', help='tab completion for bash: `source <(cardputer-mc completion)`, or --install for good')
+    sp.add_argument('--install', action='store_true', help=f'write it to {COMPLETION_FILE}')
     sp = sub.add_parser('install', help='set up this machine (--client: a PC that only uses a remote radio)')
-    sub.add_parser('uninstall', help='remove what install made')
+    sp.add_argument('--client', action='store_true')
+    sp.add_argument('--name', metavar='NAME')
+    sp.add_argument('--key', metavar='HEX')
+    sp.add_argument('-y', '--yes', action='store_true')
+    sp = sub.add_parser('uninstall', help='remove what install made')
+    sp.add_argument('--keep-identity', action='store_true')
+    sp.add_argument('--purge', action='store_true')
+    sp.add_argument('-y', '--yes', action='store_true')
+    sub.add_parser('__names')                                          # for the tab completion
+    return ap
+
+
+def main():
+    ap = build_parser()
     opts = ap.parse_args()
     command = opts.command
+    if command == 'radio':                                             # `radio ACTION`; `radio` alone shows the status
+        command = opts.command = opts.radio_command or 'status'
+        if command in ('keep', 'sound') and not hasattr(opts, 'mode'):
+            opts.mode = None
+        if command == 'up' and not hasattr(opts, 'keep'):
+            opts.keep = False
     if opts.serial:
         global SERIAL
         if opts.remote:
@@ -5797,7 +5973,8 @@ def main():
         SERIAL = opts.serial
         os.environ['CARDPUTER_MC_SERIAL'] = SERIAL         # the daemon, started detached, inherits it
     if opts.remote and command in ('check', 'daemon', 'up', 'stop', 'status', 'keep', 'sound', 'update'):
-        sys.exit(f'{APP}: {command} works on the machine that has the radio; use: ssh {opts.remote} {APP} {command}')
+        full = command if command == 'update' else f'radio {command}'
+        sys.exit(f'{APP}: {full} works on the machine that has the radio; use: ssh {opts.remote} {APP} {full}')
     if opts.remote:
         try:
             open_tunnel(opts.remote)
@@ -5831,6 +6008,10 @@ def main():
         sys.exit(run_cli(globals()['cmd_' + command], opts))
     if command == 'update':
         sys.exit(cmd_update(opts))
+    if command == 'completion':
+        sys.exit(cmd_completion(opts, build_parser()))
+    if command == '__names':
+        sys.exit(cmd_names())
     if command == 'check':
         sys.exit(check())
     if command == 'stop':
