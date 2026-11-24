@@ -5267,7 +5267,6 @@ def cmd_update(opts) -> int:
                 print(f'could not restart the radio daemon: {e}')
                 return 1
         return rc
-    print(f'looking at {UPDATE_REPO} ...')
     r = _git(repo, 'fetch', '-q', UPDATE_REPO, UPDATE_BRANCH, timeout=120)
     if r.returncode:
         print(f'{APP}: fetch failed: {r.stderr.strip() or "no network?"}')
