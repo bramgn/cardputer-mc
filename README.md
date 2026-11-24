@@ -2,7 +2,8 @@
 
 A MeshCore chat client for the **M5 CardputerZero with the Cap-LoRa-1262** module. One Python file,
 no separate radio program: it starts [meshcore-pi](https://github.com/brianwiddas/meshcore-pi) as a
-child process (which drives the SX1262 over SPI), switches the module's 5V supply on, and runs an
+child process (which drives the SX1262 over SPI), switches the module's 5V supply on, switches the Cap's antenna
+(pin P0 of its I/O expander at I2C 0x43, which meshcore-pi does not touch; without it the link was 10 to 15 dB weaker), and runs an
 ncurses chat on top. Quitting stops meshcore-pi and switches the 5V supply off again.
 
 The chat UI is derived from `mcorechat` (ncurses MeshCore client for companion radios); this

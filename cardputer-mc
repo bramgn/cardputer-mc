@@ -1168,6 +1168,78 @@ def _set_5v(on: bool):
         pass                              # no such LED (not a Cardputer) or no permission
 
 
+CAP_I2C, CAP_EXPANDER = '/dev/i2c-1', 0x43       # the Cap LoRa-1262's PI4IOE5V6408 I/O expander
+
+
+def _expander_io(fd: int):
+    def rd(reg: int) -> int:
+        os.write(fd, bytes([reg]))
+        return os.read(fd, 1)[0]
+
+    def wr(reg: int, value: int):
+        os.write(fd, bytes([reg, value]))
+    return rd, wr
+
+
+def cap_antenna_on() -> dict | None:
+    """Switch the Cap LoRa-1262's antenna switch on: pin P0 of its PI4IOE5V6408 expander must be an output driven high
+    (M5Stack's own app does the same). meshcore-pi never touches the expander, and with P0 left as a pulled-down input the
+    link was 10 to 15 dB weaker. Only P0 is changed. Returns the registers to restore, or None (no Cap, or no expander)."""
+    import fcntl
+    try:
+        fd = os.open(CAP_I2C, os.O_RDWR)
+    except OSError:
+        return None
+    try:
+        fcntl.ioctl(fd, 0x0703, CAP_EXPANDER)                 # I2C_SLAVE
+        rd, wr = _expander_io(fd)
+        for attempt in range(10):                             # the expander needs a moment after the 5V rail comes on
+            try:
+                ident = rd(0x01)
+                break
+            except OSError:
+                if attempt == 9:
+                    return None
+                time.sleep(0.05)
+        if ident & 0xfc != 0xa0:
+            log.warning('Cap expander at 0x%02x did not identify itself (id 0x%02x); antenna switch left alone', CAP_EXPANDER, ident)
+            return None
+        saved = {reg: rd(reg) for reg in (0x03, 0x05, 0x07, 0x0b)}
+        for reg, value in ((0x05, saved[0x05] | 1), (0x0b, saved[0x0b] & ~1),         # latch high first, no pull on P0,
+                           (0x03, saved[0x03] | 1), (0x07, saved[0x07] & ~1)):        # then make it an active output
+            wr(reg, value)
+        if not (rd(0x05) & 1 and rd(0x03) & 1 and not rd(0x07) & 1):
+            log.warning('Cap antenna switch: P0 did not read back as an output driven high')
+            return None
+        log.info('Cap LoRa-1262 antenna switch on (expander P0 high)')
+        return saved
+    except OSError as e:
+        log.warning('Cap antenna switch: %s', e)
+        return None
+    finally:
+        os.close(fd)
+
+
+def cap_antenna_off(saved: dict | None):
+    if not saved:
+        return
+    try:
+        fd = os.open(CAP_I2C, os.O_RDWR)
+    except OSError:
+        return
+    try:
+        import fcntl
+        fcntl.ioctl(fd, 0x0703, CAP_EXPANDER)
+        rd, wr = _expander_io(fd)
+        wr(0x07, rd(0x07) | 1)                                 # P0 off the pin first, then put the rest back
+        for reg in (0x05, 0x0b, 0x03, 0x07):
+            wr(reg, (rd(reg) & ~1) | (saved[reg] & 1))
+    except OSError:
+        pass                                                   # the rail may already be off
+    finally:
+        os.close(fd)
+
+
 def _port_free() -> bool:
     with socket.socket() as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1213,6 +1285,7 @@ def pad(s: str, n: int) -> str:
 class LocalRadio:
     def __init__(self):
         self.proc = None
+        self.cap = None                   # the expander registers to restore (see cap_antenna_on)
 
     async def start(self):
         # A start right after another radio was stopped can find the GPIO lines still claimed; meshcore-pi
@@ -1233,6 +1306,8 @@ class LocalRadio:
         os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
         start_at = os.path.getsize(LOG_FILE) if os.path.exists(LOG_FILE) else 0
         _set_5v(True)
+        await asyncio.sleep(0.2)
+        self.cap = await asyncio.to_thread(cap_antenna_on)
         try:
             with open(LOG_FILE, 'ab') as log:
                 self.proc = await asyncio.create_subprocess_exec(
@@ -1281,6 +1356,8 @@ class LocalRadio:
                 except ProcessLookupError:
                     pass
                 await proc.wait()
+        cap, self.cap = self.cap, None
+        await asyncio.to_thread(cap_antenna_off, cap)
         _set_5v(False)
 
 
