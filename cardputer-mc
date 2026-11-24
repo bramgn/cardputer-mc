@@ -4637,17 +4637,18 @@ def sound_device() -> list:
 
 
 def chime_file(kind: str) -> str:
-    """A wav for a private message (two rising tones) or a channel message (one low tone); made on first use.
+    """A wav for a private message (a short low tone, then a longer one an octave up) or a channel message (one low tone); made on first use.
     The codec needs a moment to wake up, so the file starts with silence (without it a short beep is swallowed)."""
     import wave, struct
-    path = os.path.join(SOUND_DIR, f'{kind}-2.wav')
+    path = os.path.join(SOUND_DIR, f'{kind}-5.wav')
     if not os.path.exists(path):
         os.makedirs(SOUND_DIR, exist_ok=True)
         rate = 48000
-        out = [0] * int(rate * 0.4)
-        for freq, dur in (((880, 0.15), (1319, 0.25)) if kind == 'private' else ((587, 0.25),)):
+        out = [0] * int(rate * 0.7)
+        for freq, dur in (((740, 0.11), (1480, 0.2)) if kind == 'private' else ((587, 0.25),)):      # private: "tu-DUU", low then an octave up
             n = int(rate * dur)
-            out += [int(26000 * min(1, i / 400, (n - i) / 2000) * math.sin(2 * math.pi * freq * i / rate)) for i in range(n)]
+            fade = n // 4                                     # a short tone must not be mostly fade
+            out += [int(26000 * min(1, i / 150, (n - i) / min(2000, fade)) * math.sin(2 * math.pi * freq * i / rate)) for i in range(n)]
         out += [0] * int(rate * 0.1)
         with wave.open(path, 'wb') as w:
             w.setnchannels(2)
