@@ -148,6 +148,19 @@ Everything lands in the shared history, so a running chat window shows messages 
 (with the delivery mark) and `listen`/`read` also collect what arrived while no window was open.
 Repeaters are not a target for `send`: they take commands, which stay in the chat (Enter on the repeater).
 
+## Updating
+
+```
+cardputer-mc update --check    # is there something newer on GitHub? (exit 10 when there is)
+cardputer-mc update            # fast-forward this git checkout, re-apply the meshcore-pi fixes, restart an idle daemon
+```
+
+`update` only moves forward (`git merge --ff-only`) and refuses when the checkout has local changes. It restarts the radio
+daemon only when no window is open; otherwise it says what to run when you are done (`cardputer-mc stop; cardputer-mc up`;
+a daemon started with `--serial` needs that option again). It is never automatic: the chat looks once a day (a `git ls-remote`
+of the public repository, 10 seconds after it starts) and puts `update available: run cardputer-mc update` in the status
+line. Turn the look off with `CARDPUTER_MC_NO_UPDATE_CHECK=1` or `"update_check": false` in `~/.config/cardputer-mc/config.json`.
+
 ## Using a MeshCore USB companion (a Heltec ...) instead of the Cap-LoRa
 
 A board running MeshCore's USB companion firmware speaks the same frames as meshcore-pi, over a serial line, so the

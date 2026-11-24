@@ -55,6 +55,8 @@ PI_DIR = os.path.join(HOME_DIR, 'meshcore-pi')
 PI_CONFIG = os.path.join(HOME_DIR, 'config.toml')
 PI_REPO = 'https://github.com/brianwiddas/meshcore-pi'
 PI_COMMIT = '85de8dc'                    # the version this client was tested with
+UPDATE_REPO = 'https://github.com/bramgn/cardputer-mc.git'      # where `update` and the start-up notice look
+UPDATE_BRANCH = 'master'
 PI_PATCH = r'''diff --git a/basicmesh.py b/basicmesh.py
 index 08f0c19..083cc39 100644
 --- a/basicmesh.py
@@ -534,6 +536,22 @@ def install_client():
     return 0
 
 
+def apply_pi_patches():
+    """Local fixes on top of the pinned meshcore-pi (MeshCore >= 1.11 path hashes, TX power, ...), in order; each is
+    skipped when it is already applied (a reverse check)."""
+    for name, patch in (('multi-byte path hashes, RX race', PI_PATCH), ('ACKs with extra bytes', PI_PATCH_ACK),
+                        ('TX power command (applied between packets, max 22)', PI_PATCH_TX),
+                        ('binary requests: status, telemetry, neighbours of repeaters', PI_PATCH_BIN),
+                        ('import contact (meshcore:// links)', PI_PATCH_IMPORT),
+                        ('radio receive thread sleeps instead of using a whole core', PI_PATCH_RX)):
+        if subprocess.run(['git', '-C', PI_DIR, 'apply', '--check', '-R', '-'], input=patch, text=True,
+                          capture_output=True).returncode == 0:
+            print(f'  fix already applied: {name}')
+        else:
+            subprocess.run(['git', '-C', PI_DIR, 'apply', '--whitespace=nowarn', '-'], input=patch, text=True, check=True)
+            print(f'  applied fix: {name}')
+
+
 def install(argv):
     ap = argparse.ArgumentParser(prog=f'{APP} install', description='Set up meshcore-pi, a venv and a config.')
     ap.add_argument('--name', default='Cardputer', help='node name shown to others (default: Cardputer)')
@@ -579,18 +597,7 @@ def install(argv):
     if not os.path.isdir(os.path.join(PI_DIR, '.git')):
         _run(['git', 'clone', '-q', PI_REPO, PI_DIR])
     _run(['git', '-C', PI_DIR, 'checkout', '-q', PI_COMMIT])
-    # local fixes: MeshCore >= 1.11 multi-byte path hashes, and a receive race in the LoRa driver loop
-    for name, patch in (('multi-byte path hashes, RX race', PI_PATCH), ('ACKs with extra bytes', PI_PATCH_ACK),
-                        ('TX power command (applied between packets, max 22)', PI_PATCH_TX),
-                        ('binary requests: status, telemetry, neighbours of repeaters', PI_PATCH_BIN),
-                        ('import contact (meshcore:// links)', PI_PATCH_IMPORT),
-                        ('radio receive thread sleeps instead of using a whole core', PI_PATCH_RX)):
-        if subprocess.run(['git', '-C', PI_DIR, 'apply', '--check', '-R', '-'], input=patch, text=True,
-                          capture_output=True).returncode == 0:
-            print(f'  fix already applied: {name}')
-        else:
-            subprocess.run(['git', '-C', PI_DIR, 'apply', '--whitespace=nowarn', '-'], input=patch, text=True, check=True)
-            print(f'  applied fix: {name}')
+    apply_pi_patches()
 
     print('4/5 config')
     if os.path.exists(PI_CONFIG):
@@ -845,7 +852,7 @@ def _bootstrap():
         sys.exit(0)
     if sys.argv[1:2] in (['-h'], ['--help']):
         print(f'usage: {APP} [--remote [USER@]HOST]\n       {APP} [--remote HOST] send TARGET TEXT... | read [TARGET] | contacts | addcontact LINK | channels | info | advert | ping TARGET | listen\n'
-              f'       {APP} check | up [--keep] | keep [on|off] | sound [off|private|all|test] | stop | status\n       {APP} install [--client] [--name NAME] [--key HEX] [-y]\n'
+              f'       {APP} check | up [--keep] | keep [on|off] | sound [off|private|all|test] | stop | status | update [--check]\n       {APP} install [--client] [--name NAME] [--key HEX] [-y]\n'
               f'       {APP} uninstall [--keep-identity] [--purge] [-y]\n       {APP} --version   ({APP} COMMAND --help for details)\n')
         print(__doc__.split('State lives')[0].strip())
         sys.exit(0)
@@ -4072,6 +4079,22 @@ class UiMixin:
         CardputerZero's 45 columns give the messages most of the room (the title bar shows the full name)."""
         return max(MIN_SIDEBAR_W, min(SIDEBAR_W, w // 4))
 
+    @staticmethod
+    def draw_confirm(scr, h: int, w: int, msg: str):
+        """A question that stands out: everything behind it dimmed, the question in a three-row highlighted block."""
+        for y in range(h):
+            try:
+                scr.chgat(y, 0, w - 1 if y == h - 1 else -1, curses.A_DIM)
+            except curses.error:
+                pass
+        width = min(w - 1, len(msg) + 4)
+        x0, y0 = max(0, (w - width) // 2), max(0, h // 2 - 1)
+        attr = theme_REV | curses.A_BOLD
+        for i, line in enumerate((blank(width), pad(blank((width - len(msg)) // 2) + msg, width), blank(width))):
+            if y0 + i < h:
+                scr.addnstr(y0 + i, x0, line, w - 1 - x0, attr)
+        curses.curs_set(0)
+
     def draw(self, scr):
         h, w = scr.getmaxyx()
         self.scr_h = h
@@ -4199,20 +4222,11 @@ class UiMixin:
         if self.ask:
             self.draw_ask(scr, h, w)
         if self.confirm_remove:
-            msg = f' {self.confirm_remove["label"]}?  [y] yes  [n/Esc] no '
-            y0, x0 = h // 2, max(0, (w - len(msg)) // 2)
-            scr.addnstr(y0, x0, msg, w - 1 - x0, theme_REV | curses.A_BOLD)
-            curses.curs_set(0)
+            self.draw_confirm(scr, h, w, f' {self.confirm_remove["label"]}?  [y] yes  [n/Esc] no ')
         if self.confirm_quit:
-            msg = ' Quit? [y/n] '
-            y0, x0 = h // 2, max(0, (w - len(msg)) // 2)
-            scr.addnstr(y0, x0, msg, w - 1 - x0, theme_REV | curses.A_BOLD)
-            curses.curs_set(0)
+            self.draw_confirm(scr, h, w, ' Quit? [y/n] ')
         if self.confirm_stop:
-            msg = ' Keep radio running? [y/n] '
-            y0, x0 = h // 2, max(0, (w - len(msg)) // 2)
-            scr.addnstr(y0, x0, msg, w - 1 - x0, theme_REV | curses.A_BOLD)
-            curses.curs_set(0)
+            self.draw_confirm(scr, h, w, ' Keep radio running? [y/n] ')
         scr.refresh()
 
 
@@ -4857,13 +4871,15 @@ class Daemon:
                         break
 
     def _chime(self, frame: bytes):
-        """A sound for a new message: private (two tones) or channel (one tone), by the /sound setting."""
+        """A sound for a new message: private (two tones) or channel (one tone), by the /sound setting; none while a window is open."""
         mode = sound_mode()
         private = frame[0] in (7, 16)
         if mode == 'off' or (mode == 'private' and not private):
             return
         txt_type = frame[11] if frame[0] == 16 else frame[8] if frame[0] == 7 else 0
         now = time.time()
+        if self.clients:                     # a window is open: you are looking at it, so no chime
+            return
         if txt_type != 0 or now - self.last_chime < 2.0 or self.no_sound:      # repeater replies and bursts stay quiet
             return
         self.last_chime = now
@@ -5165,6 +5181,121 @@ def daemon_status() -> int:
 
 
 # ======================================================================
+# update
+# ======================================================================
+
+UPDATE_CHECK_FILE = os.path.join(HOME_DIR, 'update.check')
+
+
+def _git(repo: str, *args, timeout: int = 60) -> subprocess.CompletedProcess:
+    return subprocess.run(['git', '-C', repo, *args], capture_output=True, text=True, timeout=timeout)
+
+
+def _repo_dir() -> str | None:
+    """The git checkout this script runs from, or None (a copied file)."""
+    d = os.path.dirname(os.path.realpath(__file__))
+    try:
+        return d if _git(d, 'rev-parse', '--is-inside-work-tree').stdout.strip() == 'true' else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def update_available() -> str | None:
+    """Short id of a newer commit on the public repository, or None. At most one look a day (git ls-remote, nothing is
+    sent but the connection itself); CARDPUTER_MC_NO_UPDATE_CHECK=1 or "update_check": false in the config turns it off."""
+    if os.environ.get('CARDPUTER_MC_NO_UPDATE_CHECK') or load_config().get('update_check') is False:
+        return None
+    repo = _repo_dir()
+    if repo is None:
+        return None
+    try:
+        with open(UPDATE_CHECK_FILE) as f:
+            cached = json.load(f)
+    except (OSError, ValueError):
+        cached = {}
+    if time.time() - cached.get('t', 0) > 86400 or not cached.get('sha'):
+        try:
+            out = _git(repo, 'ls-remote', UPDATE_REPO, f'refs/heads/{UPDATE_BRANCH}', timeout=10).stdout.split()
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if not out:
+            return None
+        cached = {'t': time.time(), 'sha': out[0]}
+        try:
+            os.makedirs(HOME_DIR, exist_ok=True)
+            with open(UPDATE_CHECK_FILE, 'w') as f:
+                json.dump(cached, f)
+        except OSError:
+            pass
+    sha = cached['sha']
+    if _git(repo, 'rev-parse', 'HEAD').stdout.strip() == sha or _git(repo, 'merge-base', '--is-ancestor', sha, 'HEAD').returncode == 0:
+        return None                                   # we have it, or we are ahead of it
+    return sha[:7]
+
+
+def cmd_update(opts) -> int:
+    """update: fetch the newest version, fast-forward this checkout, re-apply the meshcore-pi patches, and restart the
+    radio daemon when no window is using it. update --check only looks."""
+    repo = _repo_dir()
+    if repo is None:
+        print(f'{APP}: {os.path.realpath(__file__)} is not inside a git checkout; clone {UPDATE_REPO} to update it')
+        return 1
+    if opts.apply:                                    # second step, run by the new code after the merge
+        if os.path.isdir(os.path.join(PI_DIR, '.git')):
+            print('meshcore-pi fixes:')
+            apply_pi_patches()
+        pid = daemon_pid()
+        if pid is None:
+            print('the radio daemon is not running; the next start uses the new version')
+            return 0
+        try:
+            with open(STATUS_FILE) as f:
+                windows = json.load(f).get('windows', 0)
+        except (OSError, ValueError):
+            windows = 0
+        if windows:
+            print(f'the radio daemon (pid {pid}) keeps the old code until it restarts: close the {windows} window(s), '
+                  f'then run: {APP} stop; {APP} up')
+            return 0
+        rc, message = stop_daemon_quietly()
+        print(message)
+        if rc == 0:
+            try:
+                asyncio.run(ensure_daemon())
+                print('radio daemon restarted with the new version')
+            except RuntimeError as e:
+                print(f'could not restart the radio daemon: {e}')
+                return 1
+        return rc
+    print(f'looking at {UPDATE_REPO} ...')
+    r = _git(repo, 'fetch', '-q', UPDATE_REPO, UPDATE_BRANCH, timeout=120)
+    if r.returncode:
+        print(f'{APP}: fetch failed: {r.stderr.strip() or "no network?"}')
+        return 1
+    local, remote = _git(repo, 'rev-parse', 'HEAD').stdout.strip(), _git(repo, 'rev-parse', 'FETCH_HEAD').stdout.strip()
+    if local == remote or _git(repo, 'merge-base', '--is-ancestor', remote, local).returncode == 0:
+        print(f'up to date ({local[:7]})' + ('' if local == remote else ', ahead of the published version'))
+        return 0
+    print('new:')
+    print(_git(repo, 'log', '--format=  %h %s', f'{local}..{remote}').stdout.rstrip())
+    if opts.check:
+        return 10
+    if _git(repo, 'status', '--porcelain', '--untracked-files=no').stdout.strip():
+        print(f'{APP}: there are local changes in {repo}; commit or stash them first (nothing was changed)')
+        return 1
+    r = _git(repo, 'merge', '--ff-only', remote)
+    if r.returncode:
+        print(f'{APP}: cannot fast-forward ({r.stderr.strip() or r.stdout.strip()}); update by hand in {repo}')
+        return 1
+    print(f'updated {local[:7]} -> {remote[:7]}', flush=True)
+    try:
+        os.remove(UPDATE_CHECK_FILE)
+    except OSError:
+        pass
+    os.execv(sys.executable, [sys.executable, os.path.realpath(__file__), 'update', '--apply'])       # continue with the new code
+
+
+# ======================================================================
 # cli
 # ======================================================================
 
@@ -5212,9 +5343,19 @@ async def run(scr, args):
             await asyncio.sleep(5)
             app.sync_history()
     saver = asyncio.create_task(autosave())
+
+    async def update_notice():
+        await asyncio.sleep(10)                          # after the connection message has had its moment
+        newer = await asyncio.to_thread(update_available)
+        if newer:
+            app.status = f'update available ({newer}): run {APP} update'
+            log.info(app.status)
+            app.dirty = True
+    notice = asyncio.create_task(update_notice())
     try:
         await ui(scr, app)
     finally:
+        notice.cancel()
         saver.cancel()
         app.sync_history()
         await app.disconnect()
@@ -5591,6 +5732,9 @@ def main():
     sp.add_argument('mode', nargs='?', choices=list(SOUND_MODES) + ['test'])
     sub.add_parser('stop', help='stop the radio daemon and switch the radio off')
     sub.add_parser('status', help='is the radio daemon running')
+    sp = sub.add_parser('update', help='fetch the newest version from GitHub, re-apply the meshcore-pi fixes, restart an idle daemon')
+    sp.add_argument('--check', action='store_true', help='only say whether there is something new (exit 10 when there is)')
+    sp.add_argument('--apply', action='store_true', help=argparse.SUPPRESS)
     sp = sub.add_parser('send', help='send a message: send Yoshi "hello", send "#test" hi there (TEXT - reads stdin)')
     sp.add_argument('target', help='contact or channel name (a leading # = channel; a part of the name is enough)')
     sp.add_argument('text', nargs='+')
@@ -5631,7 +5775,7 @@ def main():
             sys.exit(f'{APP}: check tests the Cap-LoRa wiring, not a USB companion')
         SERIAL = opts.serial
         os.environ['CARDPUTER_MC_SERIAL'] = SERIAL         # the daemon, started detached, inherits it
-    if opts.remote and command in ('check', 'daemon', 'up', 'stop', 'status', 'keep', 'sound'):
+    if opts.remote and command in ('check', 'daemon', 'up', 'stop', 'status', 'keep', 'sound', 'update'):
         sys.exit(f'{APP}: {command} works on the machine that has the radio; use: ssh {opts.remote} {APP} {command}')
     if opts.remote:
         try:
@@ -5664,6 +5808,8 @@ def main():
         sys.exit(0)
     if command in ('send', 'read', 'contacts', 'channels', 'info', 'advert', 'listen', 'addcontact', 'ping'):
         sys.exit(run_cli(globals()['cmd_' + command], opts))
+    if command == 'update':
+        sys.exit(cmd_update(opts))
     if command == 'check':
         sys.exit(check())
     if command == 'stop':
