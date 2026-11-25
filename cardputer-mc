@@ -450,6 +450,99 @@ PI_PATCH_RX = r'''diff --git a/interfaces/lorainterface.py b/interfaces/lorainte
  
              # Let the interrupt handler finish (not set after a transmit, hence the timeout)
 '''
+PI_PATCH_NOISE = r'''diff --git a/companionradio.py b/companionradio.py
+index b27169f..da37d3d 100644
+--- a/companionradio.py
++++ b/companionradio.py
+@@ -69,6 +69,7 @@ CMD_SEND_TELEMETRY_REQ = 39
+ CMD_GET_CUSTOM_VARS = 40
+ CMD_SET_CUSTOM_VAR = 41
+ CMD_GET_ADVERT_PATH = 42
++CMD_GET_STATS = 56
+ CMD_SEND_BINARY_REQ = 50
+ 
+ RESP_CODE_OK = 0
+@@ -83,6 +84,7 @@ RESP_CODE_CHANNEL_MSG_RECV = 8  # a reply to CMD_SYNC_NEXT_MESSAGE (ver < 3)
+ RESP_CODE_CURR_TIME = 9  # a reply to CMD_GET_DEVICE_TIME
+ RESP_CODE_NO_MORE_MESSAGES = 10  # a reply to CMD_SYNC_NEXT_MESSAGE
+ RESP_CODE_EXPORT_CONTACT = 11
++RESP_CODE_STATS = 24
+ RESP_CODE_BATTERY_VOLTAGE = 12  # a reply to CMD_GET_BATTERY_VOLTAGE
+ RESP_CODE_DEVICE_INFO = 13  # a reply to CMD_DEVICE_QUERY
+ RESP_CODE_PRIVATE_KEY = 14  # a reply to CMD_EXPORT_PRIVATE_KEY
+@@ -1027,6 +1029,17 @@ class CompanionRadio(BasicMesh):
+                     logger.debug(f"Contact found: {contact.name}, advert path = {pathstr(contact.advertpath)}")
+                     response = struct.pack("<BLB", RESP_CODE_ADVERT_PATH, contact.rxtime, len(contact.advertpath)) + bytes(contact.advertpath)
+ 
++            elif command == CMD_GET_STATS and len(frame) >= 2 and frame[1] == 1:
++                # Radio statistics: noise floor (dBm), last rssi, last snr (x4), tx/rx airtime (not tracked)
++                lora = next((i for i in self.dispatch.interfaces if hasattr(i, 'noise_floor')), None)
++                noise = lora.noise_floor() if lora else None
++                if noise is None:
++                    response = ERR(ERR_CODE_NOT_FOUND)
++                else:
++                    response = struct.pack("<BBhbbII", RESP_CODE_STATS, 1, int(round(noise)),
++                                           max(-128, min(127, int(lora.last_rssi))),
++                                           max(-128, min(127, int(lora.last_snr * 4))), 0, 0)
++
+             else:
+                 logger.warning(f"Unknown command: {command}")
+                 response = ERR(ERR_CODE_NOT_FOUND)
+diff --git a/interfaces/lorainterface.py b/interfaces/lorainterface.py
+index 2c04d1d..8738e66 100644
+--- a/interfaces/lorainterface.py
++++ b/interfaces/lorainterface.py
+@@ -128,6 +128,10 @@ class LoRaInterface(Interface):
+         self.LoRa.setLoRaPacket(self.LoRa.HEADER_EXPLICIT, 16, 255, True, False)
+         self.LoRa.setSyncWord(0x12)
+ 
++        self.noise_samples = deque(maxlen=20)       # recent instantaneous RSSI readings (dBm)
++        self.last_rssi = 0
++        self.last_snr = 0
++
+         self.airtime_dutycycle = airtime     # % duty cycle (default 10%)
+ 
+         self.airtime_txtimestamp = deque([0,0,0,0,0], maxlen=5)
+@@ -146,10 +150,17 @@ class LoRaInterface(Interface):
+         self.LoRa.request(self.LoRa.RX_CONTINUOUS)
+     
+         s = ["STATUS_DEFAULT", "STATUS_TX_WAIT", "STATUS_TX_TIMEOUT", "STATUS_TX_DONE", "STATUS_RX_WAIT", "STATUS_RX_CONTINUOUS", "STATUS_RX_TIMEOUT", "STATUS_RX_DONE", "STATUS_HEADER_ERR", "STATUS_CRC_ERR", "STATUS_CAD_WAIT", "STATUS_CAD_DETECTED", "STATUS_CAD_DONE"]
++        next_noise = 0
+         while True:
+             if self.LoRa._irq != -1:                # interrupt mode: the handler sets _statusIrq for us
+                 while not self.LoRa._statusIrq:
+                     time.sleep(0.002)
++                    if time.monotonic() >= next_noise:      # idle in receive: sample the instantaneous RSSI
++                        next_noise = time.monotonic() + 0.25
++                        try:
++                            self.noise_samples.append(self.LoRa.rssiInst())
++                        except Exception:
++                            pass
+             self.LoRa.wait()
+ 
+             # Let the interrupt handler finish (not set after a transmit, hence the timeout)
+@@ -169,6 +180,7 @@ class LoRaInterface(Interface):
+ 
+                 rssi = self.LoRa.packetRssi()
+                 snr = self.LoRa.snr()
++                self.last_rssi, self.last_snr = rssi, snr
+ 
+                 self.eventloop.call_soon_threadsafe(self.rx_q.put_nowait, (data,rssi,snr))
+                 logger.debug(f"Packet data, {hexlify(data).decode()}")
+@@ -186,6 +198,11 @@ class LoRaInterface(Interface):
+ 
+             self.LoRa.request(self.LoRa.RX_CONTINUOUS)
+ 
++    def noise_floor(self):
++        # Median of the recent readings, so a packet that is being received does not count; None until sampled
++        samples = sorted(self.noise_samples)
++        return samples[len(samples) // 2] if samples else None
++
+     # FIXME race condition here - what is the proper timeout for a transmission?
+     def tx_done(self, tx_time):
+         self.txtime = tx_time
+'''
+
 APT_PACKAGES = ['git', 'python3-venv', 'python3-rpi-lgpio', 'python3-lgpio']
 PIP_PACKAGES = ['meshcore', 'pycryptodome', 'aiotools', 'pyserial_asyncio', 'typing-extensions', 'LoRaRF']
 
@@ -555,7 +648,8 @@ def apply_pi_patches():
                ('TX power command (applied between packets, max 22)', PI_PATCH_TX),
                ('binary requests: status, telemetry, neighbours of repeaters', PI_PATCH_BIN),
                ('import contact (meshcore:// links)', PI_PATCH_IMPORT),
-               ('radio receive thread sleeps instead of using a whole core', PI_PATCH_RX))
+               ('radio receive thread sleeps instead of using a whole core', PI_PATCH_RX),
+               ('noise floor (CMD_GET_STATS, radio)', PI_PATCH_NOISE))
     tmp = tempfile.mkdtemp(prefix='cmc-pi-')
     try:
         tar = subprocess.run(['git', '-C', PI_DIR, 'archive', PI_COMMIT], capture_output=True, check=True).stdout
@@ -1877,10 +1971,30 @@ class ConnectionMixin:
 
     async def keepalive(self):
         """Ask for the battery now and then: it keeps the title bar's battery fresh (the daemon looks after the radio link)."""
+        tick = 0
         while self.mc is not None:
-            await asyncio.sleep(45)
+            await asyncio.sleep(NOISE_EVERY)
             if self.mc is not None:
-                await self.refresh_battery()
+                await self.sample_noise()
+                tick += 1
+                if tick % max(1, 45 // NOISE_EVERY) == 0:
+                    await self.refresh_battery()
+
+    async def sample_noise(self):
+        """One reading of the radio's noise floor (dBm) for the /noise graph; radios that do not report it are left alone."""
+        if self.noise_unsupported:
+            return
+        try:
+            got = await read_noise(self)
+        except Exception:
+            got = None
+        if got is None or got[0] is None:
+            self.noise_misses += 1
+            self.noise_unsupported = self.noise_misses >= 3 and not self.noise_hist
+            return
+        self.noise_hist.append(got[0])
+        if self.noise_open:
+            self.dirty = True
 
     async def disconnect(self, reason: str = 'disconnected'):
         task, self.keepalive_task = self.keepalive_task, None
@@ -3486,7 +3600,7 @@ class CommandsMixin:
                                 'settings', 'clear', 'cls', 'log', 'console', 'radio', 'rx', 'rxlog', 'repeaters',
                                 'help', 'q', 'h', '?', 'keep', 'stop', 'sound'))
     COMMAND_NAMES = ('act', 'actions', 'advert', 'channel', 'clear', 'connect', 'contact', 'disconnect', 'help', 'info', 'log', 'menu', 'quit',
-                     'reload', 'repeaters', 'ping', 'radio', 'reboot', 'search', 'options', 'theme', 'trace', 'keep', 'stop', 'sound')
+                     'reload', 'repeaters', 'ping', 'radio', 'noise', 'reboot', 'search', 'options', 'theme', 'trace', 'keep', 'stop', 'sound')
 
     def complete(self):
         """Tab completion for /commands in the input line."""
@@ -3608,6 +3722,7 @@ class CommandsMixin:
             ('radio', 'rx', 'rxlog'): lambda: self.select(RX_KEY),
             ('repeaters',): lambda: setattr(self, 'show_repeaters', not self.show_repeaters),
             ('h', 'help', '?'): self.help,
+            ('n', 'noise'): self.noise,
         }
         for names, fn in cmds.items():
             if name in names:
@@ -3673,6 +3788,7 @@ class CommandsMixin:
         ('/advert  /a', 'advert menu, or /advert zero|flood'),
         ('/clear', 'empty the selected conversation (Log, Radio, channel or chat)'),
         ('/log  /console', 'show the Log'),
+        ('/noise', 'the radio noise floor as a graph (a reading every few seconds while connected)'),
         ('/radio  /rxlog', 'show the Radio packet list (F9)'),
         ('/search  /f', 'search all messages: /search <text>'),
         ('/trace  /t', 'trace hops: /trace 78,64,78 or repeater names'),
@@ -3689,28 +3805,46 @@ class CommandsMixin:
     def help(self):
         self.help_open, self.help_scroll = True, 0
 
-    def draw_help(self, scr, h, w):
-        bw = min(w - 2, 72)
-        room = max(3, h - 4)
-        self.help_scroll = min(self.help_scroll, max(0, len(self.HELP) - room))
-        rows = self.HELP[self.help_scroll:self.help_scroll + room]
-        bh = len(rows) + 3
-        y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+    def noise(self):
+        self.noise_open = True
+        if self.noise_unsupported or (self.mc is not None and not self.noise_hist):
+            self.noise_unsupported = False
+            self.noise_misses = 0
+            asyncio.create_task(self.guarded(self.sample_noise()))
+
+    def draw_noise(self, scr, h, w):
+        """The noise floor over the last minutes as a bar graph in the message pane: more bars = more noise (less negative dBm).
+        It follows the size of that pane, so a bigger terminal shows a taller and wider graph (more minutes)."""
+        sw = self.sidebar_width(w)
+        x0, bw = sw + 2, w - sw - 3
+        y0, bh = 1, h - 3
+        if bw < 12 or bh < 4:
+            return
         for y in range(bh):
-            scr.addstr(y0 + y, x0, blank(bw), theme_REV)
-        scr.addnstr(y0, x0 + 1, f'Help — {APP} {__version__}', bw - 2, theme_REV | curses.A_BOLD)
-        wide = max((len(f'{a:<24}{b}') for a, b in self.HELP), default=0)        # the longest line of the whole text
-        hmax = max(0, wide - (bw - 2))
-        self.help_hscroll = min(self.help_hscroll, hmax)
-        hs = self.help_hscroll
-        for i, (a, b) in enumerate(rows):
-            if a and not b:
-                scr.addnstr(y0 + 1 + i, x0 + 1, a[hs:], bw - 2, theme_REV | curses.A_UNDERLINE)
-            else:
-                scr.addnstr(y0 + 1 + i, x0 + 1, f'{a:<24}{b}'[hs:], bw - 2, theme_REV)
-        vert, horiz = len(self.HELP) > room, hmax > 0
-        scr.addnstr(y0 + bh - 1, x0 + 1, f'{"↑↓" if vert else ""}{"←→" if horiz else ""} scroll · other key closes'
-                    if vert or horiz else 'press any key to close', bw - 2, theme_REV | curses.A_DIM)
+            scr.addstr(y0 + y, sw + 1, blank(w - sw - 1))
+        scr.addnstr(y0, x0, 'Noise floor (dBm)', bw, curses.A_BOLD)
+        rows = bh - 3
+        hist = list(self.noise_hist)
+        if not hist:
+            msg = 'this radio does not report its noise floor' if self.noise_unsupported else 'measuring...'
+            scr.addnstr(y0 + 2, x0, msg, bw)
+        else:
+            vals = hist[-(bw - 5):]
+            lo, hi = min(vals), max(vals)
+            lo = min(lo, hi - 6)                                  # a flat line must stay flat
+            lo, hi = lo - 1, hi + 1
+            cells = [min(rows * 8, max(1, round((v - lo) / (hi - lo) * rows * 8))) for v in vals]
+            ascii_only = not (getattr(sys.stdout, 'encoding', None) or '').lower().startswith('utf')
+            for r in range(rows):                                 # top row first
+                base = (rows - 1 - r) * 8
+                line = ''.join(' ' if c <= base else '#' if ascii_only else SPARK[min(7, c - base - 1)] for c in cells)
+                label = f'{hi:4.0f}' if r == 0 else f'{lo:4.0f}' if r == rows - 1 else f'{(lo + hi) / 2:4.0f}' if r == rows // 2 and rows >= 5 else '    '
+                scr.addnstr(y0 + 1 + r, x0, f'{label} {line}'.replace(' ', NBSP), bw)
+            summary = f'now {hist[-1]:.0f}  min {min(hist):.0f}  avg {sum(hist) / len(hist):.0f}  max {max(hist):.0f}   {len(vals) * NOISE_EVERY // 60} min'
+            if len(summary) > bw:
+                summary = f'now {hist[-1]:.0f} min {min(hist):.0f} max {max(hist):.0f}'
+            scr.addnstr(y0 + rows + 1, x0, summary, bw, curses.A_BOLD)
+        scr.addnstr(y0 + bh - 1, x0, 'higher = noisier · any key closes' if bw >= 34 else 'any key closes', bw, curses.A_DIM)
         curses.curs_set(0)
 
 
@@ -3741,7 +3875,7 @@ class UiMixin:
         """True while typed letters are text: a question being answered, a setting being edited, the prompt."""
         if self.ask or (self.settings_open and self.set_edit is not None):
             return True
-        modal = (self.details is not None or self.help_open or self.confirm_quit or self.confirm_stop or self.confirm_remove
+        modal = (self.details is not None or self.help_open or self.noise_open or self.confirm_quit or self.confirm_stop or self.confirm_remove
                  or self.settings_open or self.cmenu_open or self.advert_menu_open or self.search)
         return self.focus == 'input' and not modal
 
@@ -3813,6 +3947,10 @@ class UiMixin:
                 self.settings_open = True
             elif back and self.selected == back[0]:
                 self.cmenu_open, self.cmenu_sel = True, back[1]
+            return
+        if self.noise_open:
+            self.noise_open = False
+            self.dirty = True
             return
         if self.help_open:
             if k == curses.KEY_UP:
@@ -4242,6 +4380,8 @@ class UiMixin:
             self.draw_settings(scr, h, w)
         if self.help_open:
             self.draw_help(scr, h, w)
+        if self.noise_open:
+            self.draw_noise(scr, h, w)
         if self.details is not None:
             self.draw_details(scr, h, w)
         if self.search:
@@ -4439,6 +4579,10 @@ class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMi
         self.confirm_remove: dict | None = None
         self.help_open = False
         self.help_scroll = 0
+        self.noise_open = False
+        self.noise_hist: collections.deque = collections.deque(maxlen=NOISE_KEEP)      # noise floor readings, dBm
+        self.noise_misses = 0
+        self.noise_unsupported = False
         self.passwords: dict[str, str] = self.load_passwords()   # repeater key prefix -> remembered password
         self.admin: set[str] = set()         # repeaters / rooms we are logged in to (key prefixes)
         self.radio_bat: int | None = None        # companion battery in mV (None when it has no gauge)
@@ -5797,6 +5941,63 @@ async def cmd_ping(a) -> int:
         await cli_finish(app)
 
 
+NOISE_EVERY = 5               # seconds between noise floor readings
+NOISE_KEEP = 360              # readings kept: 30 minutes
+SPARK = '\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588'
+SPARK_ASCII = '_.-~^'
+
+
+def sparkline(values, lo, hi, ascii_only=False) -> str:
+    """One character per value, scaled between lo and hi (dBm)."""
+    chars = SPARK_ASCII if ascii_only else SPARK
+    span = max(hi - lo, 1)
+    return ''.join(chars[min(len(chars) - 1, max(0, int((v - lo) / span * len(chars))))] for v in values)
+
+
+async def read_noise(app):
+    """(noise floor dBm, last rssi, last snr) from the radio, or None when it does not say."""
+    r = await app.mc.commands.get_stats_radio()
+    if r.type == EventType.ERROR:
+        return None
+    p = r.payload
+    return p.get('noise_floor'), p.get('last_rssi'), p.get('last_snr')
+
+
+async def cmd_noise(a) -> int:
+    """The noise floor of the radio (dBm): one reading, or a live graph with --watch."""
+    app = await cli_app()
+    try:
+        first = await read_noise(app)
+        if first is None:
+            raise CliError('the radio does not report its noise floor (not yet measured, or an older companion)')
+        if not a.watch:
+            nf, rssi, snr = first
+            print(f'noise floor {nf} dBm, last packet rssi {rssi} dBm snr {snr} dB')
+            return 0
+        stop = asyncio.Event()
+        asyncio.get_running_loop().add_signal_handler(signal.SIGINT, stop.set)
+        width = max(10, min(shutil.get_terminal_size().columns - 28, 120))
+        history, n = [first[0]], 0
+        while not stop.is_set() and (a.count == 0 or n < a.count):
+            try:
+                await asyncio.wait_for(stop.wait(), a.interval)
+            except asyncio.TimeoutError:
+                pass
+            if stop.is_set():
+                break
+            cur = await read_noise(app)
+            if cur is None:
+                continue
+            n += 1
+            history = (history + [cur[0]])[-width:]
+            lo, hi = min(history), max(history)
+            lo = min(lo, hi - 6)                      # never stretch a flat line into noise
+            print(f'{datetime.now().strftime("%H:%M:%S")} {cur[0]:4d} dBm {sparkline(history, lo, hi, not sys.stdout.encoding or "utf" not in sys.stdout.encoding.lower())} {lo}..{hi}', flush=True)
+        return 0
+    finally:
+        await cli_finish(app)
+
+
 async def cmd_advert(a) -> int:
     app = await cli_app()
     try:
@@ -5930,6 +6131,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument('target')
     sp.add_argument('-c', '--count', type=int, default=4, metavar='N', help='number of pings (0 = until Ctrl-C)')
     sp.add_argument('-i', '--interval', type=float, default=2.0, metavar='SEC')
+    sp = sub.add_parser('noise', help='the radio noise floor in dBm (--watch: a live graph, Ctrl-C ends)')
+    sp.add_argument('-w', '--watch', action='store_true')
+    sp.add_argument('-c', '--count', type=int, default=0, metavar='N', help='with --watch: number of readings (0 = until Ctrl-C)')
+    sp.add_argument('-i', '--interval', type=float, default=2.0, metavar='SEC')
     sp = sub.add_parser('advert', help='announce this node (zero hop; --flood for everyone)')
     sp.add_argument('--flood', action='store_true')
     sp = sub.add_parser('listen', help='print incoming messages as they arrive (Ctrl-C ends)')
@@ -6004,7 +6209,7 @@ def main():
             sys.exit(f'{APP}: {e}')
         print('radio daemon: running' + (', and it stays running when no window is open' if _keep_daemon() else ''))
         sys.exit(0)
-    if command in ('send', 'read', 'contacts', 'channels', 'info', 'advert', 'listen', 'addcontact', 'ping'):
+    if command in ('send', 'read', 'contacts', 'channels', 'info', 'advert', 'listen', 'addcontact', 'ping', 'noise'):
         sys.exit(run_cli(globals()['cmd_' + command], opts))
     if command == 'update':
         sys.exit(cmd_update(opts))

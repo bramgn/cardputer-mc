@@ -140,6 +140,7 @@ cardputer-mc channels
 cardputer-mc info                       # name, key, frequency, battery (--json)
 cardputer-mc advert [--flood]
 cardputer-mc ping Repeater78 [-c 4] [-i 2]  # (-c 0: until Ctrl-C) zero-hop trace to a repeater or room server: SNR + round trip; exit 0 if any answered
+cardputer-mc noise [-w] [-c N] [-i 2]   # the radio noise floor in dBm; -w: a live sparkline per line (Ctrl-C ends)
 cardputer-mc radio up                   # start the daemon and exit
 ```
 
@@ -253,6 +254,14 @@ on DIO3, RF switch on DIO2. In the EU, 869.4–869.65 MHz allows up to 27 dBm ER
 Changing TX power or the radio clock from inside the chat has no effect: meshcore-pi ignores those
 commands. Edit `config.toml` and reconnect.
 
+## Noise floor
+
+`/noise` (or `/n`) shows the radio's noise floor as a bar graph in the message pane: a reading every 5 seconds
+while connected, the last 30 minutes kept, and the graph follows the size of the pane (a bigger terminal shows a
+taller graph and more minutes). Higher bars = more noise, so a bad antenna connection or interference shows up at
+once. `cardputer-mc noise` prints one reading, `noise --watch` a live sparkline. On a MeshCore USB companion the
+firmware reports it; on the Cap-LoRa meshcore-pi gets it from the SX1262 (see below).
+
 ## Fixes applied to meshcore-pi
 
 `install` patches the pinned meshcore-pi checkout (the patch is embedded in the script; re-running
@@ -265,6 +274,8 @@ commands. Edit `config.toml` and reconnect.
   sets the IRQ status, over the same SPI bus the receive loop uses. Packets could come out with the
   wrong length or bytes (and zero-length packets). The receive loop now waits for the handler to finish.
 
+- **Noise floor.** While idle the receive thread reads the chip's instantaneous RSSI four times a second; the
+  median of the last 20 readings is answered to `CMD_GET_STATS` (radio), which stock meshcore-pi does not know.
 - **ACKs with extra bytes.** Newer firmware appends two bytes after the 4-byte ack hash. Stock meshcore-pi
   rejected those (`Ack packet payload is not 4 bytes`), so a message that did arrive was never shown as
   delivered. Now the first four bytes are used.
