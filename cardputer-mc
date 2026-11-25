@@ -2381,6 +2381,8 @@ class MessagingMixin:
             sr['sel'] = max(0, sr['sel'] - 1)
         elif k == curses.KEY_DOWN:
             sr['sel'] = min(n - 1, sr['sel'] + 1)
+        elif k == '\t':                                      # Tab: the next hit, round to the first
+            sr['sel'] = (sr['sel'] + 1) % n
         elif k == curses.KEY_PPAGE:
             sr['sel'] = max(0, sr['sel'] - 10)
         elif k == curses.KEY_NPAGE:
@@ -2966,6 +2968,8 @@ class SettingsMixin:
             self.set_sel = max(0, self.set_sel - 1)
         elif k == curses.KEY_DOWN:
             self.set_sel = min(len(self.SETTINGS) - 1, self.set_sel + 1)
+        elif k in (curses.KEY_PPAGE, curses.KEY_NPAGE):
+            self.set_sel = max(0, min(len(self.SETTINGS) - 1, self.set_sel + (-self.page_rows() if k == curses.KEY_PPAGE else self.page_rows())))
         elif k in (curses.KEY_HOME, curses.KEY_END):
             self.set_sel = 0 if k == curses.KEY_HOME else len(self.SETTINGS) - 1
         elif k in (curses.KEY_LEFT, curses.KEY_RIGHT) and which == 'theme':
@@ -3609,6 +3613,8 @@ class ContactsMixin:
             self.cmenu_sel = max(0, self.cmenu_sel - 1)
         elif k == curses.KEY_DOWN:
             self.cmenu_sel = min(n - 1, self.cmenu_sel + 1)
+        elif k in (curses.KEY_PPAGE, curses.KEY_NPAGE):
+            self.cmenu_sel = max(0, min(n - 1, self.cmenu_sel + (-self.page_rows() if k == curses.KEY_PPAGE else self.page_rows())))
         elif k in (curses.KEY_HOME, curses.KEY_END):
             self.cmenu_sel = 0 if k == curses.KEY_HOME else n - 1
         elif k == '\n':
@@ -4017,6 +4023,10 @@ class UiMixin:
         if self.details is not None:
             self.dirty = True
             page = max(1, self.scr_h - 5)
+            if k == '\t':                                          # Tab: the next page; after the last one, back to the top
+                last = max(0, len(self.details) - page)
+                self.details_scroll = 0 if self.details_scroll >= last else self.details_scroll + page
+                return
             if k in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE,
                      curses.KEY_HOME, curses.KEY_END):
                 self.details_scroll = {curses.KEY_UP: self.details_scroll - 1,
@@ -4049,6 +4059,8 @@ class UiMixin:
                 self.help_scroll = max(0, self.help_scroll - 10)
             elif k == curses.KEY_NPAGE:
                 self.help_scroll += 10
+            elif k == '\t':                                  # Tab: the next page; at the end, back to the top
+                self.help_scroll = 0 if self.help_scroll >= max(0, len(self.HELP) - max(3, self.scr_h - 4)) else self.help_scroll + 10
             elif k == curses.KEY_HOME:
                 self.help_scroll = 0
             elif k == curses.KEY_END:
@@ -4260,16 +4272,18 @@ class UiMixin:
         c = self.selected_contact()
         return c is not None and c.get('type', 1) == 1
 
+    def page_rows(self) -> int:
+        """The number of rows a PageUp / PageDown moves in a list or menu: the screen less its frame, one row overlapping."""
+        return max(1, self.scr_h - 5)
+
     def handle_side_key(self, k) -> bool:
         """Keys while the list on the left has focus; returns False to fall through to the input."""
         if k in (curses.KEY_UP, '\x10'):
             self.move(-1)
         elif k in (curses.KEY_DOWN, '\x0e'):
             self.move(1)
-        elif k == curses.KEY_PPAGE:
-            self.scroll += 5
-        elif k == curses.KEY_NPAGE:
-            self.scroll = max(0, self.scroll - 5)
+        elif k in (curses.KEY_PPAGE, curses.KEY_NPAGE):             # a page of the list at a time
+            self.move(-self.page_rows() if k == curses.KEY_PPAGE else self.page_rows())
         elif k in (curses.KEY_HOME, curses.KEY_END):
             rows = self.side_rows()
             if rows:
@@ -4283,7 +4297,7 @@ class UiMixin:
                 self.focus = 'input'          # the prompt is only active after an explicit Enter
             else:
                 self.open_contact_menu()      # repeaters, rooms, Log, Radio: nothing to type yet
-        elif k == '\t' and self.next_heading():
+        elif k == '\t' and self.next_item():
             pass
         elif k in ('\t', curses.KEY_RIGHT):  # to the messages, if there are any, else on to the function keys
             if self.history.get(self.selected):
@@ -4821,15 +4835,17 @@ class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMi
             cur = ('h', grp) if ('h', grp) in keys else (keys[0] if keys else None)
         return cur
 
-    def next_heading(self) -> bool:
-        """Tab in the list: on to the next heading below the cursor (Channels > Contacts > Console); False after the last."""
+    def next_item(self) -> bool:
+        """Tab in the list: on to the next row, headings and conversations alike; False after the last row."""
         keys = [k for _, k, _ in self.side_rows()]
         cur = self.list_cursor(keys)
-        for k in keys[keys.index(cur) + 1:] if cur in keys else keys:
-            if k[0] == 'h':
-                self.goto(k)
-                return True
-        return False
+        if cur not in keys:
+            return False
+        i = keys.index(cur)
+        if i + 1 >= len(keys):
+            return False
+        self.goto(keys[i + 1])
+        return True
 
     def cursor_header(self) -> tuple | None:
         """The heading under the list cursor, if it is on one (and that heading is still there)."""
@@ -6335,6 +6351,10 @@ def main():
         pass
     except Exception as e:
         raise SystemExit(f'{APP}: {type(e).__name__}: {e}')
+    finally:
+        if sys.stdout.isatty():                  # leave a clean screen, also on terminals without an alternate screen
+            sys.stdout.write('\x1b[2J\x1b[3J\x1b[H')
+            sys.stdout.flush()
 
 
 if __name__ == '__main__':
