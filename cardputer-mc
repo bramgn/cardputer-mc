@@ -2491,8 +2491,8 @@ class MessagingMixin:
             self.focus = 'side'
         elif k == curses.KEY_RIGHT:
             pass
-        elif k == '\x1b':
-            self.focus_back()
+        elif k == '\x1b':                    # Esc is Tab backwards: to the list
+            self.focus = 'side'
         elif k == curses.KEY_UP:
             self.msg_sel = max(0, self.msg_sel - 1)
         elif k == curses.KEY_DOWN:
@@ -4230,6 +4230,14 @@ class UiMixin:
                 heads = [k for _, k, _ in self.side_rows() if k[0] == 'h']
                 if heads:
                     self.goto(heads[0])
+        elif k == '\x1b':                         # Esc is Tab backwards: one slot to the left, then to the messages, then up the list
+            if self.fsel > 0:
+                self.fsel -= 1
+            elif self.history.get(self.selected):
+                self.focus = 'msgs'
+                self.msg_sel = len(self.history[self.selected]) - 1
+            else:
+                self.focus = 'side'
         elif k in ('\x1b', curses.KEY_UP):
             self.focus_back()
         elif k == '\n':
@@ -4308,7 +4316,9 @@ class UiMixin:
                 self.focus = 'fkeys'
         elif k == curses.KEY_LEFT and self.cursor_header() and self.cursor_header()[1] not in self.collapsed:
             self.toggle_group(self.cursor_header()[1])
-        elif k in (curses.KEY_LEFT, '\x1b'):
+        elif k == '\x1b':                    # Esc is Tab backwards: a row up the list (nothing above the first)
+            self.prev_item()
+        elif k == curses.KEY_LEFT:
             pass
         elif k in ('/', ':', ' '):
             self.start_typing(k)
@@ -4834,6 +4844,15 @@ class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMi
             grp = self.group_of(cur)
             cur = ('h', grp) if ('h', grp) in keys else (keys[0] if keys else None)
         return cur
+
+    def prev_item(self) -> bool:
+        """Esc in the list: back to the row above; False on the first row."""
+        keys = [k for _, k, _ in self.side_rows()]
+        cur = self.list_cursor(keys)
+        if cur not in keys or keys.index(cur) == 0:
+            return False
+        self.goto(keys[keys.index(cur) - 1])
+        return True
 
     def next_item(self) -> bool:
         """Tab in the list: on to the next row, headings and conversations alike; False after the last row."""
