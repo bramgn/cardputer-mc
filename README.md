@@ -276,6 +276,9 @@ firmware reports it; on the Cap-LoRa meshcore-pi gets it from the SX1262 (see be
 
 - **Noise floor.** While idle the receive thread reads the chip's instantaneous RSSI four times a second; the
   median of the last 20 readings is answered to `CMD_GET_STATS` (radio), which stock meshcore-pi does not know.
+- **Transmit led.** The CardputerZero's green ACT led lights up for the length of every transmission. Set
+  `txled = ""` under `[interface.caplora]` in the meshcore-pi config to switch it off (or another name from
+  `/sys/class/leds`). Writing to the led switches its kernel trigger to `none`; a reboot brings the old one back.
 - **ACKs with extra bytes.** Newer firmware appends two bytes after the 4-byte ack hash. Stock meshcore-pi
   rejected those (`Ack packet payload is not 4 bytes`), so a message that did arrive was never shown as
   delivered. Now the first four bytes are used.

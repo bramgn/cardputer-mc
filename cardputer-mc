@@ -543,6 +543,64 @@ index 2c04d1d..8738e66 100644
          self.txtime = tx_time
 '''
 
+PI_PATCH_LED = r'''diff --git a/interfaces/lorainterface.py b/interfaces/lorainterface.py
+index 8738e66..4733471 100644
+--- a/interfaces/lorainterface.py
++++ b/interfaces/lorainterface.py
+@@ -1,5 +1,6 @@
+ 
+ import asyncio
++import os
+ from aiotools import current_taskgroup
+ import threading
+ import time
+@@ -128,6 +129,13 @@ class LoRaInterface(Interface):
+         self.LoRa.setLoRaPacket(self.LoRa.HEADER_EXPLICIT, 16, 255, True, False)
+         self.LoRa.setSyncWord(0x12)
+ 
++        # LED that lights up during a transmission (a name under /sys/class/leds; "" = off)
++        led = config.get("txled", "ACT")
++        self.txled = f"/sys/class/leds/{led}/brightness" if led else None
++        if self.txled and not os.access(self.txled, os.W_OK):
++            logger.info(f"TX led {led} is not writable, not using it")
++            self.txled = None
++
+         self.noise_samples = deque(maxlen=20)       # recent instantaneous RSSI readings (dBm)
+         self.last_rssi = 0
+         self.last_snr = 0
+@@ -240,6 +248,14 @@ class LoRaInterface(Interface):
+ 
+         return 0
+ 
++    def set_txled(self, on):
++        if self.txled:
++            try:
++                with open(self.txled, "w") as f:
++                    f.write("1" if on else "0")
++            except OSError:
++                self.txled = None
++
+     async def transmit(self, packetdata):
+         logger.debug(f"Transmitting: {hexlify(packetdata).decode()}")
+                 
+@@ -252,6 +268,7 @@ class LoRaInterface(Interface):
+             self.txpower_applied = self.txpower
+             logger.info(f"TX power set to {self.txpower} dBm")
+ 
++        self.set_txled(True)
+         self.LoRa.beginPacket()
+         self.LoRa.put(packetdata)
+         self.LoRa.endPacket()
+@@ -267,6 +284,7 @@ class LoRaInterface(Interface):
+         except TimeoutError:
+             logger.debug("Transmit timed out")
+     
++        self.set_txled(False)
+         self.txdone.clear()
+         return self.txtime
+ 
+'''
+
 APT_PACKAGES = ['git', 'python3-venv', 'python3-rpi-lgpio', 'python3-lgpio']
 PIP_PACKAGES = ['meshcore', 'pycryptodome', 'aiotools', 'pyserial_asyncio', 'typing-extensions', 'LoRaRF']
 
@@ -649,7 +707,8 @@ def apply_pi_patches():
                ('binary requests: status, telemetry, neighbours of repeaters', PI_PATCH_BIN),
                ('import contact (meshcore:// links)', PI_PATCH_IMPORT),
                ('radio receive thread sleeps instead of using a whole core', PI_PATCH_RX),
-               ('noise floor (CMD_GET_STATS, radio)', PI_PATCH_NOISE))
+               ('noise floor (CMD_GET_STATS, radio)', PI_PATCH_NOISE),
+               ('the ACT led lights up during a transmission', PI_PATCH_LED))
     tmp = tempfile.mkdtemp(prefix='cmc-pi-')
     try:
         tar = subprocess.run(['git', '-C', PI_DIR, 'archive', PI_COMMIT], capture_output=True, check=True).stdout
