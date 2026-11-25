@@ -254,6 +254,17 @@ on DIO3, RF switch on DIO2. In the EU, 869.4–869.65 MHz allows up to 27 dBm ER
 Changing TX power or the radio clock from inside the chat has no effect: meshcore-pi ignores those
 commands. Edit `config.toml` and reconnect.
 
+## Routes
+
+The details of a received message (Enter on it) show its route: `flood, 1 hop(s): NO-4517-RPT1 (78ac)`, taken from the
+radio-log packet the message arrived in. Channel messages (always flooded) show the repeaters they passed. A message
+that arrived on a direct route shows no repeaters: each one removes itself from the path while forwarding. The
+message is shown for the first copy that reaches you; a later copy through a repeater is a duplicate and is dropped,
+but the Radio view still lists it with its path.
+
+Actions (F6) > Set path sets the route to a contact by hand: hops are hex, 1 to 3 bytes each and all the same
+length, e.g. `78`, `78,64` or `78ac,64e1` (use the length your repeaters' hashes have; the Radio view shows it).
+
 ## Noise floor
 
 `/noise` (or `/n`) shows the radio's noise floor as a bar graph in the message pane: a reading every 5 seconds

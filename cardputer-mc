@@ -2223,20 +2223,41 @@ class ConnectionMixin:
 # ======================================================================
 
 class MessagingMixin:
+    def rx_route(self, kind: str, text: str, sender_ts, src: str = '') -> dict:
+        """How a message that just came in travelled: the radio log packet it arrived in (the message event itself carries
+        no path for a direct route). A channel message is found by its text and time, a direct one as the latest
+        packet from that sender. Returns {rx_route, rx_hops} or nothing when the packet is not known."""
+        now = time.time()
+        for t, p in reversed(self.rx_recent):
+            if now - t > 60:
+                break
+            if kind == 'GRP_TXT':
+                if p.get('payload_typename') != 'GRP_TXT' or p.get('message') != text or p.get('sender_timestamp') != sender_ts:
+                    continue
+            elif p.get('payload_typename') != 'TXT_MSG' or p.get('rx_used') or (src and (p.get('payload') or '')[2:4] != src[:2]):
+                continue
+            p['rx_used'] = True
+            return {'rx_route': (p.get('route_typename') or '?').lower(), 'rx_hops': self.path_hops(p)}
+        return {}
+
     def on_contact_msg(self, event):
         p = event.payload
         prefix = p.get('pubkey_prefix', '')[:12]
         c = self.mc.get_contact_by_key_prefix(prefix) if prefix else None
         who = c['adv_name'] if c else prefix[:8]
+        info = dict(p)
+        info.update(self.rx_route('TXT_MSG', p.get('text', ''), p.get('sender_timestamp'), prefix))
         self.add(('d', prefix), Msg(p.get('sender_timestamp', 0), who, p.get('text', ''),
-                                    recv=int(datetime.now().timestamp()), info=dict(p)))
+                                    recv=int(datetime.now().timestamp()), info=info))
 
     def on_chan_msg(self, event):
         p = event.payload
         # channel text already arrives as "sender: message"
         key = ('c', p.get('channel_idx', 0))
+        info = dict(p)
+        info.update(self.rx_route('GRP_TXT', p.get('text', ''), p.get('sender_timestamp')))
         msg = Msg(p.get('sender_timestamp', 0), '', p.get('text', ''),
-                  recv=int(datetime.now().timestamp()), info=dict(p))
+                  recv=int(datetime.now().timestamp()), info=info)
         if self.is_blocked(key, self.sender_of(msg)):
             return
         self.add(key, msg)
@@ -2435,7 +2456,12 @@ class MessagingMixin:
             rows.append(('Sent (sender clock)', fmt(info.get('sender_timestamp', 0))))
             rows.append(('Received', fmt(m.recv)))
             plen = info.get('path_len')
-            if plen is not None:
+            hops = info.get('rx_hops')
+            if info.get('rx_route'):
+                rows.append(('Route', info['rx_route'] + (f', {len(hops)} hop(s): ' + ' > '.join(hops) if hops else
+                                                           ', no repeater in the path' if info['rx_route'] == 'flood' else
+                                                           ' (the path is used up on arrival: it does not say which repeaters)')))
+            elif plen is not None:
                 rows.append(('Route', 'direct' if plen == 255 else f'{plen} hop(s)'))
             for label, k, unit in (('SNR', 'SNR', ' dB'), ('RSSI', 'RSSI', ' dBm')):
                 if k in info:
@@ -2615,6 +2641,8 @@ class MessagingMixin:
             extra = f'  ack {path}'
         if hops:
             extra += '  path ' + ' > '.join(hops)
+        if ptype in ('GRP_TXT', 'TXT_MSG'):
+            self.rx_recent.append((time.time(), dict(p)))
         if ptype == 'GRP_TXT' and p.get('message') is not None:
             self.count_repeat(p)
         now = int(datetime.now().timestamp())
@@ -3272,7 +3300,7 @@ class ContactsMixin:
             route = 'direct'
         else:
             route = f'{n} hop(s): ' + ' > '.join(
-                self.hop_name(h) for h in self.hops_of(c.get('out_path', ''), n))
+                self.hop_name(h) for h in self.hops_of(c.get('out_path', ''), n, (c.get('out_path_hash_mode') or 0) + 1))
         rows = [('Name', c.get('adv_name', '?')),
                 ('Type', NODE_TYPES.get(c.get('type'), '?')),
                 ('Public key', c['public_key']),
@@ -3414,7 +3442,7 @@ class ContactsMixin:
             self.dirty = True
             return
         if action == 'setpath':
-            self.ask = {'label': f'New path for {name} (hex hops, e.g. 78,64; empty = direct)',
+            self.ask = {'label': f'New path for {name} (hex hops, e.g. 78,64 or 78ac,64e1; empty = direct)',
                         'text': '', 'cb': self.apply_set_path, 'contact': c}
             self.dirty = True
             return
@@ -3429,7 +3457,7 @@ class ContactsMixin:
     async def contact_radio_action(self, action: str, c: dict):
         name, key = c.get('adv_name', '?'), c['public_key']
         n = c.get('out_path_len', -1)
-        hops = self.hops_of(c.get('out_path', ''), n) if n not in (-1, 255) else []
+        hops = self.hops_of(c.get('out_path', ''), n, (c.get('out_path_hash_mode') or 0) + 1) if n not in (-1, 255) else []
         relay = c.get('type') in (2, 3)
         if action in ('status', 'telemetry', 'clock', 'owner', 'regions', 'neighbours'):
             title = {'status': 'Status', 'telemetry': 'Telemetry', 'clock': 'Clock', 'owner': 'Owner info',
@@ -3465,7 +3493,7 @@ class ContactsMixin:
             lines = []
             for label, k in (('Out', 'out_path'), ('In', 'in_path')):
                 cnt = p.get(f'{k}_len', 0)
-                hs = self.hops_of(p.get(k, ''), cnt)
+                hs = self.hops_of(p.get(k, ''), cnt, (p.get(f'{k}_hash_mode') or 0) + 1)
                 lines.append(f'{label}: {cnt} hop(s)' + (': ' + ' > '.join(self.hop_name(h) for h in hs) if hs else ''))
             self.show(f'Route: {name}', lines)
             self.status = 'route discovered'
@@ -3478,13 +3506,14 @@ class ContactsMixin:
 
     async def apply_set_path(self, text: str, c: dict):
         parts = [p for p in text.replace(' ', '').lower().replace(',', ' ').split() if p]
-        if any(len(p) != 2 or any(ch not in '0123456789abcdef' for ch in p) for p in parts):
-            self.status = 'path must be 1-byte hex hops, e.g. 78,64'
+        size = len(parts[0]) // 2 if parts else 1
+        if any(len(p) != 2 * size or size > 3 or len(p) % 2 or any(ch not in '0123456789abcdef' for ch in p) for p in parts):
+            self.status = 'path: hex hops of 1 to 3 bytes, all the same length, e.g. 78,64 or 78ac,64e1'
             return
         if not self.need_radio():
             return
         async with self.radio_lock:
-            r = await self.mc.commands.change_contact_path(c, ''.join(parts))
+            r = await self.mc.commands.change_contact_path(c, ''.join(parts), path_hash_mode=size - 1)
         self.status = (f'path set for {c.get("adv_name", "?")}' if r.type != EventType.ERROR
                        else f'set path failed: {describe_error(r.payload)}')
 
@@ -4639,6 +4668,7 @@ class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMi
         self.help_open = False
         self.help_scroll = 0
         self.noise_open = False
+        self.rx_recent: collections.deque = collections.deque(maxlen=30)     # recent text packets from the radio log, for the route of a message
         self.noise_hist: collections.deque = collections.deque(maxlen=NOISE_KEEP)      # noise floor readings, dBm
         self.noise_misses = 0
         self.noise_unsupported = False
@@ -4859,8 +4889,9 @@ class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMi
         return f'{hits[0]["adv_name"]} ({h})' if hits else h
 
     @staticmethod
-    def hops_of(path_hex: str, n: int) -> list[str]:
-        return [path_hex[i:i + 2] for i in range(0, n * 2, 2)]
+    def hops_of(path_hex: str, n: int, size: int = 1) -> list[str]:
+        """The n hops of a stored path, `size` bytes (2 hex characters each) per hop."""
+        return [path_hex[i:i + 2 * size] for i in range(0, n * 2 * size, 2 * size)]
 
     def show(self, title: str, lines: list[str]):
         if self.details is None or title != self.details_title:
@@ -5832,7 +5863,7 @@ def cli_route(app: 'App', c: dict) -> str:
         return 'flood'
     if n == 0:
         return 'direct'
-    return ' > '.join(app.hop_name(h) for h in app.hops_of(c.get('out_path', ''), n))
+    return ' > '.join(app.hop_name(h) for h in app.hops_of(c.get('out_path', ''), n, (c.get('out_path_hash_mode') or 0) + 1))
 
 
 async def cmd_send(a) -> int:
