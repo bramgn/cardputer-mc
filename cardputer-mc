@@ -1062,6 +1062,8 @@ from meshcore.events import EventType
 
 CONFIG_FILE = os.path.expanduser('~/.config/cardputer-mc/config.json')
 HISTORY_FILE = os.path.expanduser('~/.config/cardputer-mc/history.json')
+INPUT_HISTORY_FILE = os.path.join(os.path.dirname(HISTORY_FILE), 'input_history.json')     # what was typed in the prompt, for Up / Down
+INPUT_HISTORY_KEEP = 200
 PASSWORDS_FILE = os.path.expanduser('~/.config/cardputer-mc/passwords.json')   # opt-in, mode 0600
 RX_KEY = ('r', 0)           # 'Radio': received packets as a pseudo-conversation
 LOG_KEY = ('l', 0)          # 'Log': status messages and library log lines
@@ -3240,9 +3242,7 @@ class ContactsMixin:
         elif action == 'browse':
             self.focus, self.msg_sel = 'msgs', max(0, len(self.history.get(key, [])) - 1)
         elif action == 'clear':
-            self.history[key] = []
-            self.unread.pop(key, None)
-            self.status = f'cleared {self.name_for(key)}'
+            self.clear_current(key)
         elif action in ('notify', 'keep', 'people', 'block', 'rename'):
             await self.channel_action(action, key)
         elif action == 'chdetails':
@@ -3834,9 +3834,10 @@ class CommandsMixin:
                 return
         self.status = f'unknown command /{name} (try /help)'
 
-    def clear_current(self):
-        """Empty the selected conversation (Log and Radio included)."""
-        key = self.selected
+    def clear_current(self, key=None):
+        """Empty a conversation, by default the selected one (Log and Radio included). The clear mark makes the other
+        windows, and the shared history file the next sync would merge back in, drop their copies too."""
+        key = key or self.selected
         if key is None:
             return
         self.history[key] = []
@@ -3849,7 +3850,7 @@ class CommandsMixin:
 
     HELP = (
         ('Keys', ''),
-        ('Up / Down', 'move through the list on the left'),
+        ('Up / Down', 'move through the list on the left; in the prompt: earlier / later text and commands you sent (^P / ^N switch conversation)'),
         ('z c f x', 'left / right / up / down whenever you are not typing (the arrows sit on the Fn layer)'),
         ('h j k l', 'the same, Vim style; G = end, gg = top, Ctrl-D / Ctrl-U = half page down / up'),
         ('PgUp / PgDn', 'scroll history'),
@@ -4140,10 +4141,13 @@ class UiMixin:
             return
         if self.focus == 'msgs' and self.handle_msg_focus_key(k):
             return
+        if k not in (curses.KEY_UP, curses.KEY_DOWN):
+            self.hist_i = None                # typing or editing ends the walk through the history
         if isinstance(k, str):
             o = ord(k) if len(k) == 1 else -1
             if k == '\n':
                 text, self.buf, self.pos = self.buf.strip(), '', 0
+                self.remember_input(text)
                 await self.submit(text)
             elif o in (CTRL_Q, CTRL_C):
                 self.quit = True
@@ -4192,10 +4196,10 @@ class UiMixin:
             elif k.isprintable():
                 self.buf = self.buf[:self.pos] + k + self.buf[self.pos:]
                 self.pos += 1
-        elif k == curses.KEY_UP:
-            self.move(-1, False)
+        elif k == curses.KEY_UP:               # earlier text or command you sent (^P / ^N switch conversation)
+            self.recall(-1)
         elif k == curses.KEY_DOWN:
-            self.move(1, False)
+            self.recall(1)
         elif k == curses.KEY_PPAGE:
             self.scroll += 5
         elif k == curses.KEY_NPAGE:
@@ -4219,6 +4223,49 @@ class UiMixin:
         elif k == curses.KEY_F3:
             await self.toggle_connection()
         self.dirty = True
+
+    @staticmethod
+    def load_input_history() -> list:
+        try:
+            with open(INPUT_HISTORY_FILE) as f:
+                data = json.load(f)
+            return [t for t in data if isinstance(t, str)][-INPUT_HISTORY_KEEP:]
+        except (OSError, ValueError, TypeError):
+            return []
+
+    def remember_input(self, text: str):
+        """Keep what was sent from the prompt (messages and commands) so Up can bring it back."""
+        self.hist_i = None
+        if not text:
+            return
+        # another window may have added lines meanwhile: fold them in, then add ours (no repeat of the last line)
+        merged = self.load_input_history()
+        if not merged or merged[-1] != text:
+            merged.append(text)
+        self.input_hist = merged[-INPUT_HISTORY_KEEP:]
+        try:
+            os.makedirs(os.path.dirname(INPUT_HISTORY_FILE), exist_ok=True)
+            with open(INPUT_HISTORY_FILE + '.tmp', 'w') as f:
+                json.dump(self.input_hist, f)
+            os.replace(INPUT_HISTORY_FILE + '.tmp', INPUT_HISTORY_FILE)
+        except OSError as e:
+            log.warning('could not save the input history: %s', e)
+
+    def recall(self, step: int):
+        """Up (-1) / Down (+1) in the prompt: through earlier input; past the newest, back to what was being typed."""
+        hist = self.input_hist
+        if not hist:
+            return
+        if self.hist_i is None:
+            if step > 0:
+                return
+            self.hist_draft, self.hist_i = self.buf, len(hist)
+        i = max(0, self.hist_i + step)
+        if i >= len(hist):
+            self.hist_i, self.buf = None, self.hist_draft
+        else:
+            self.hist_i, self.buf = i, hist[i]
+        self.pos = len(self.buf)
 
     FKEYS = ('F4', 'F5', 'F6', 'F7', 'F8')        # the bar: five slots above Fn+4 ... Fn+8
 
@@ -4711,6 +4758,9 @@ class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMi
         self.help_open = False
         self.help_scroll = 0
         self.noise_open = False
+        self.input_hist: list[str] = self.load_input_history()
+        self.hist_i: int | None = None        # position in input_hist while Up / Down are walking through it
+        self.hist_draft = ''                  # what was being typed when the walk began
         self.rx_recent: collections.deque = collections.deque(maxlen=30)     # recent text packets from the radio log, for the route of a message
         self.noise_hist: collections.deque = collections.deque(maxlen=NOISE_KEEP)      # noise floor readings, dBm
         self.noise_misses = 0

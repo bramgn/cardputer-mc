@@ -80,7 +80,7 @@ Quitting: `Ctrl-C`, `Alt-X`, `Alt-Q` and `F8` ask `Quit? [y/n]` first (the same 
 or Esc cancels), also while a window is open; `Ctrl-Q` and `/q` quit at once. Alt is read as ESC followed by the
 key, which is what terminals send; in the Cardputer's own CLI app `cat -v` should show `^[x` for Alt-X.
 
-Space or `/` start typing from anywhere: Space continues what you were writing, `/` starts a new command (a draft
+In the prompt, Up and Down walk through what you sent before, messages and commands alike (kept across restarts in `~/.config/cardputer-mc/input_history.json`, 200 lines; Down past the newest brings back what you were typing). Ctrl-P / Ctrl-N switch conversation. Space or `/` start typing from anywhere: Space continues what you were writing, `/` starts a new command (a draft
 is parked on Ctrl-Y), so `/q` always quits.
 
 Going from the list to the messages (Right, `c` or Tab) puts the cursor on the message that is on the same
