@@ -4343,7 +4343,12 @@ class UiMixin:
         if k in (curses.KEY_UP, '\x10'):
             self.move(-1)
         elif k in (curses.KEY_DOWN, '\x0e'):
-            self.move(1)
+            keys = [r for _, r, _ in self.side_rows()]
+            if keys and self.list_cursor(keys) == keys[-1]:         # below the last row: on to the function bar (Up comes back)
+                self.fsel = 0
+                self.focus = 'fkeys'
+            else:
+                self.move(1)
         elif k in (curses.KEY_PPAGE, curses.KEY_NPAGE):             # a page of the list at a time
             self.move(-self.page_rows() if k == curses.KEY_PPAGE else self.page_rows())
         elif k in (curses.KEY_HOME, curses.KEY_END):
@@ -4481,19 +4486,21 @@ class UiMixin:
 
         # title
         si = (self.mc.self_info if self.mc else None) or {}
+        on_head = self.cursor_header() if self.focus == 'side' else None
+        shown = on_head[1] if on_head else (self.name_for(self.selected) if self.selected else None)
         if w < 60:                          # small screen: the conversation and the battery, so the connection state fits
-            title = f' {self.name_for(self.selected)} ' if self.selected else f' {APP} '
+            title = f' {shown} ' if shown else f' {APP} '
             if self.battery_title():
                 title += f'· {self.battery_title()} '
-            if self.repeater_cli() == 'on':
+            if self.repeater_cli() == 'on' and not on_head:
                 title += '(CLI) '
         else:
             title = f' {APP} {__version__} — {si["name"]} ' if si.get('name') else f' {APP} {__version__} '
             if self.battery_title():
                 title += f'· bat {self.battery_title()} '
-            if self.selected:
-                title += f'— {self.name_for(self.selected)} '
-                if self.repeater_cli() == 'on':
+            if shown:
+                title += f'— {shown} '
+                if self.repeater_cli() == 'on' and not on_head:
                     title += '(CLI) '
         scr.addnstr(0, 0, ' ' * w, w - 1, theme_REV)
         scr.addnstr(0, 0, title, w - 1, theme_REV)
@@ -4503,10 +4510,19 @@ class UiMixin:
             conn = conn if len(conn) <= room else conn[:room - 1] + '…'
             scr.addnstr(0, w - 1 - len(conn) - 1, conn, room, theme_REV)
 
-        # messages
-        lines = self.render_lines(mw)
+        # messages (with the cursor on a heading: about that group, not the conversation that happens to be open)
         self.last_body_h = body_h
-        if self.focus == 'msgs':
+        head = self.cursor_header() if self.focus == 'side' else None
+        if head:
+            self.msg_rows = (self.selected, {})
+            for y, (text, attr) in enumerate(self.group_lines(head[1])[:body_h]):
+                scr.addnstr(1 + y, sw + 1, text, mw, attr)
+            lines = []
+        else:
+            lines = self.render_lines(mw)
+        if head:
+            pass
+        elif self.focus == 'msgs':
             self.msg_sel = max(0, min(self.msg_sel, len(self.history.get(self.selected, [])) - 1))
             idx = [i for i, l in enumerate(lines) if l[2] == self.msg_sel]
             if idx:                          # scroll so the highlighted message is visible
@@ -4515,15 +4531,16 @@ class UiMixin:
                     self.scroll = len(lines) - idx[-1] - 1
                 elif idx[0] < end_now - body_h:
                     self.scroll = max(0, len(lines) - idx[0] - body_h)
-        self.scroll = min(self.scroll, max(0, len(lines) - body_h))
-        end = len(lines) - self.scroll
-        self.msg_rows = (self.selected, {})
-        for y, (text, attr, n) in enumerate(lines[max(0, end - body_h):end]):
-            self.msg_rows[1][1 + y] = n
-            if self.focus == 'msgs' and n == self.msg_sel:
-                attr = theme_SEL
-            scr.addnstr(1 + y, sw + 1, text, mw, attr)
-        if self.scroll:
+        if not head:
+            self.scroll = min(self.scroll, max(0, len(lines) - body_h))
+            end = len(lines) - self.scroll
+            self.msg_rows = (self.selected, {})
+            for y, (text, attr, n) in enumerate(lines[max(0, end - body_h):end]):
+                self.msg_rows[1][1 + y] = n
+                if self.focus == 'msgs' and n == self.msg_sel:
+                    attr = theme_SEL
+                scr.addnstr(1 + y, sw + 1, text, mw, attr)
+        if self.scroll and not head:
             scr.addnstr(body_h, sw + 1, f'-- {self.scroll} lines up (PgDn) --', mw, curses.A_DIM)
 
         # input + status
@@ -4895,6 +4912,25 @@ class App(FocusTrail, ConnectionMixin, MessagingMixin, SettingsMixin, ContactsMi
                 rows.append((f'- {name}' + (' (fav)' if name == 'Contacts' and self.fav_only else ''), ('h', name), 0))
                 rows += [(n, k, self.unread.get(k, 0)) for k, n in items]
         return rows
+
+    def group_lines(self, name: str) -> list[tuple[str, int]]:
+        """What the message pane shows while the list cursor is on a heading: the group, not the open conversation."""
+        items = self.groups().get(name, [])
+        unread = sum(self.unread.get(k, 0) for k, _ in items)
+        out = [(name, theme_HEAD), ('', 0)]
+        noun = {'Channels': 'channel', 'Contacts': 'contact', 'Repeaters': 'repeater / room', 'Console': 'view'}.get(name, 'item')
+        out.append((f'{len(items)} {noun}{"" if len(items) == 1 else "s"}' + (f', {unread} unread' if unread else ''), 0))
+        if name == 'Contacts':
+            favs = sum(1 for k, _ in items if k[0] == 'd' and k[1] in self.favorites)
+            out.append((f'{favs} favorite{"" if favs == 1 else "s"} · sorted by {self.SORTS[self.contact_sort]}'
+                        + (' · favorites only' if self.fav_only else ''), 0))
+        elif name == 'Console':
+            out.append(('Log: status messages, Radio: every packet heard', 0))
+        out.append(('', 0))
+        out.append(('Enter  ' + ('unfold' if name in self.collapsed else 'fold') + ' this group', curses.A_DIM))
+        out.append(('F6     actions for the whole group', curses.A_DIM))
+        out.append(('Down   ' + ('to the next heading' if name in self.collapsed or not items else 'on to the first ' + noun), curses.A_DIM))
+        return out
 
     def group_of(self, key) -> str | None:
         if key is None:
